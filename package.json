@@ -1,0 +1,37 @@
+{
+  "name": "@instant/mcp",
+  "version": "0.6.0",
+  "description": "MCP server for instant.dev — lets AI agents provision databases, caches, queues, storage, webhooks, and deploy apps and stacks without human input",
+  "keywords": [
+    "mcp",
+    "instant.dev",
+    "infrastructure",
+    "provisioning"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "instant-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "test": "node --test dist/index.test.js",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.10.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
