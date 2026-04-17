@@ -1,10 +1,10 @@
 {
   "name": "@instant/mcp",
   "version": "0.6.0",
-  "description": "MCP server for instant.dev — lets AI agents provision databases, caches, queues, storage, webhooks, and deploy apps and stacks without human input",
+  "description": "MCP server for instanode.dev — lets AI agents provision databases, caches, queues, storage, webhooks, and deploy apps and stacks without human input",
   "keywords": [
     "mcp",
-    "instant.dev",
+    "instanode.dev",
     "infrastructure",
     "provisioning"
   ],

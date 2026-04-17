@@ -1,6 +1,6 @@
 # @instant/mcp
 
-MCP server for [instant.dev](https://instant.dev) — lets AI agents (Claude Code, etc.) provision databases, caches, queues, storage, webhooks, and deployments without any human input.
+MCP server for [instanode.dev](https://instanode.dev) — lets AI agents (Claude Code, etc.) provision databases, caches, queues, storage, webhooks, and deployments without any human input.
 
 ## Install
 
@@ -23,7 +23,7 @@ That's it. No account required to start.
 
 ### `list_my_resources`
 
-List all instant.dev resources for the authenticated team.
+List all instanode.dev resources for the authenticated team.
 
 Requires `INSTANT_API_KEY` in the environment. Without a key, returns instructions for signing up.
 
@@ -77,7 +77,7 @@ Set `INSTANT_API_KEY` to use authenticated features (permanent resources, `list_
 }
 ```
 
-Without a key, anonymous provisions expire after 24h. Sign up at [instant.dev/start](https://instant.dev/start) to claim them permanently.
+Without a key, anonymous provisions expire after 24h. Sign up at [instanode.dev/start](https://instanode.dev/start) to claim them permanently.
 
 ## Development
 
@@ -88,6 +88,6 @@ npm install
 # Build
 npm run build
 
-# Test (requires a running instant.dev server)
+# Test (requires a running instanode.dev server)
 INSTANT_API_URL=http://localhost:32108 bash test.sh
 ```

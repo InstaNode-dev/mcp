@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * @instant/mcp — MCP server for instant.dev
+ * @instant/mcp — MCP server for instanode.dev
  *
  * Exposes tools to AI agents (Claude Code, etc.):
  *
@@ -11,7 +11,7 @@
  *   provision_queue        — provision a NATS JetStream queue
  *   provision_storage      — provision an S3-compatible object storage prefix
  *   provision_webhook      — provision a webhook receiver URL
- *   deploy_app             — deploy a containerized app to instant.dev hosting
+ *   deploy_app             — deploy a containerized app to instanode.dev hosting
  *   deploy_stack           — deploy a multi-service stack from an instant.yaml manifest
  *
  * Install globally for Claude Code:
@@ -36,7 +36,7 @@ import { InstantClient } from "./client.js";
 const client = new InstantClient();
 
 const server = new McpServer({
-  name: "instant.dev",
+  name: "instanode.dev",
   version: "0.6.0",
 });
 
@@ -44,7 +44,7 @@ const server = new McpServer({
 
 server.tool(
   "list_my_resources",
-  `List all instant.dev resources provisioned for the authenticated team.
+  `List all instanode.dev resources provisioned for the authenticated team.
 
 Requires INSTANT_API_KEY to be set in the environment. Without a key, returns an
 error explaining how to authenticate.
@@ -62,7 +62,7 @@ expiry time. Useful for auditing what infrastructure is currently provisioned.`,
               "INSTANT_API_KEY is not set — cannot list authenticated resources.",
               "",
               "To authenticate:",
-              "  1. Sign up at https://instant.dev/start",
+              "  1. Sign up at https://instanode.dev/start",
               "  2. Get your API key from the dashboard",
               "  3. Set INSTANT_API_KEY in your environment or pass it to the MCP server config",
               "",
@@ -118,7 +118,7 @@ expiry time. Useful for auditing what infrastructure is currently provisioned.`,
 
 server.tool(
   "provision_cache",
-  `Provision a Redis cache instance on instant.dev.
+  `Provision a Redis cache instance on instanode.dev.
 
 Returns a connection_url the caller can use immediately with any Redis client.
 Anonymous (no API key): free tier, expires in 24h, limited memory.
@@ -147,7 +147,7 @@ or in your secrets manager). Use list_my_resources to see provisioned caches.`,
               type: "text",
               text: [
                 "Redis provisioning is not yet available on this server.",
-                "Visit https://instant.dev to use the hosted service.",
+                "Visit https://instanode.dev to use the hosted service.",
               ].join("\n"),
             },
           ],
@@ -179,7 +179,7 @@ or in your secrets manager). Use list_my_resources to see provisioned caches.`,
 
 server.tool(
   "provision_document_db",
-  `Provision a MongoDB document database on instant.dev.
+  `Provision a MongoDB document database on instanode.dev.
 
 Returns a connection_url the caller can use immediately with any MongoDB driver.
 Anonymous (no API key): free tier, expires in 24h, limited storage.
@@ -207,7 +207,7 @@ The connection_url is only returned once — store it securely.`,
               type: "text",
               text: [
                 "MongoDB provisioning is not yet available on this server.",
-                "Visit https://instant.dev to use the hosted service.",
+                "Visit https://instanode.dev to use the hosted service.",
               ].join("\n"),
             },
           ],
@@ -239,7 +239,7 @@ The connection_url is only returned once — store it securely.`,
 
 server.tool(
   "provision_database",
-  `Provision a PostgreSQL database (with pgvector) using instant.dev. Returns a ready-to-use connection string. No account required — anonymous resources work immediately, expire after 24h unless claimed.`,
+  `Provision a PostgreSQL database (with pgvector) using instanode.dev. Returns a ready-to-use connection string. No account required — anonymous resources work immediately, expire after 24h unless claimed.`,
   {
     name: z
       .string()
@@ -261,7 +261,7 @@ server.tool(
               type: "text",
               text: [
                 "PostgreSQL provisioning is not yet available on this server.",
-                "Visit https://instant.dev to use the hosted service.",
+                "Visit https://instanode.dev to use the hosted service.",
               ].join("\n"),
             },
           ],
@@ -295,7 +295,7 @@ server.tool(
 
 server.tool(
   "provision_queue",
-  `Provision a NATS JetStream message queue using instant.dev. Returns a ready-to-use nats:// connection string. No account required — anonymous resources work immediately, expire after 24h unless claimed.`,
+  `Provision a NATS JetStream message queue using instanode.dev. Returns a ready-to-use nats:// connection string. No account required — anonymous resources work immediately, expire after 24h unless claimed.`,
   {
     name: z
       .string()
@@ -317,7 +317,7 @@ server.tool(
               type: "text",
               text: [
                 "NATS JetStream provisioning is not yet available on this server.",
-                "Visit https://instant.dev to use the hosted service.",
+                "Visit https://instanode.dev to use the hosted service.",
               ].join("\n"),
             },
           ],
@@ -350,7 +350,7 @@ server.tool(
 
 server.tool(
   "provision_storage",
-  `Provision an S3-compatible object storage prefix on instant.dev.
+  `Provision an S3-compatible object storage prefix on instanode.dev.
 
 Returns S3 credentials (endpoint, bucket, prefix, access_key_id, secret_access_key)
 scoped to a per-token prefix within a shared bucket. Works with any S3-compatible
@@ -381,7 +381,7 @@ Store the secret_access_key securely — it is only returned once.`,
               type: "text",
               text: [
                 "Object storage provisioning is not yet available on this server.",
-                "Visit https://instant.dev to use the hosted service.",
+                "Visit https://instanode.dev to use the hosted service.",
               ].join("\n"),
             },
           ],
@@ -424,10 +424,10 @@ Store the secret_access_key securely — it is only returned once.`,
 
 server.tool(
   "provision_webhook",
-  `Provision a webhook receiver URL on instant.dev.
+  `Provision a webhook receiver URL on instanode.dev.
 
 Returns a receive_url that accepts any HTTP method from any sender. Payloads are
-stored and retrievable via the instant.dev dashboard or API.
+stored and retrievable via the instanode.dev dashboard or API.
 
 Useful for: testing webhooks locally, inspecting Stripe/GitHub/Slack payloads
 during development, building integrations without exposing a local port.
@@ -455,7 +455,7 @@ Authenticated (INSTANT_API_KEY set): tied to your team's plan with higher limits
               type: "text",
               text: [
                 "Webhook receiver provisioning is not yet available on this server.",
-                "Visit https://instant.dev to use the hosted service.",
+                "Visit https://instanode.dev to use the hosted service.",
               ].join("\n"),
             },
           ],
@@ -492,7 +492,7 @@ Authenticated (INSTANT_API_KEY set): tied to your team's plan with higher limits
 
 server.tool(
   "deploy_app",
-  "Deploy a containerized app to instant.dev hosting. The source directory must contain a Dockerfile. Returns the deployment ID and app URL once healthy.",
+  "Deploy a containerized app to instanode.dev hosting. The source directory must contain a Dockerfile. Returns the deployment ID and app URL once healthy.",
   {
     source_dir: z.string().optional().describe("Path to source directory containing Dockerfile (default: current directory '.')"),
     name: z.string().optional().describe("Human-readable name for the deployment"),
@@ -511,7 +511,7 @@ server.tool(
               type: "text",
               text: [
                 "App deployment is not yet available on this server.",
-                "Visit https://instant.dev to use the hosted service.",
+                "Visit https://instanode.dev to use the hosted service.",
               ].join("\n"),
             },
           ],
@@ -532,7 +532,7 @@ server.tool(
     if (result.note) lines.push(`Note: ${result.note}`);
     lines.push(
       ``,
-      `Poll status at https://instant.dev/dashboard or use GET /deploy/${result.id}`
+      `Poll status at https://instanode.dev/dashboard or use GET /deploy/${result.id}`
     );
     return { content: [{ type: "text", text: lines.join("\n") }] };
   }
@@ -542,7 +542,7 @@ server.tool(
 
 server.tool(
   "deploy_stack",
-  `Deploy a multi-service stack from an instant.yaml manifest. Reads the manifest from the current directory, creates Docker images for each service, and deploys them to instant.dev infrastructure. All services share an isolated namespace and can communicate via service:// DNS.`,
+  `Deploy a multi-service stack from an instant.yaml manifest. Reads the manifest from the current directory, creates Docker images for each service, and deploys them to instanode.dev infrastructure. All services share an isolated namespace and can communicate via service:// DNS.`,
   {
     manifest_path: z
       .string()
@@ -554,7 +554,7 @@ server.tool(
       .string()
       .optional()
       .describe(
-        "Authentication token from instant.dev (required for authenticated deployments)"
+        "Authentication token from instanode.dev (required for authenticated deployments)"
       ),
   },
   async ({ manifest_path, token }) => {
@@ -571,7 +571,7 @@ server.tool(
               type: "text",
               text: [
                 "Stack deployment is not yet available on this server.",
-                "Visit https://instant.dev to use the hosted service.",
+                "Visit https://instanode.dev to use the hosted service.",
               ].join("\n"),
             },
           ],

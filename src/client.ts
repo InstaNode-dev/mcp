@@ -1,8 +1,8 @@
 /**
- * Thin HTTP client for the instant.dev REST API.
+ * Thin HTTP client for the instanode.dev REST API.
  *
  * Reads INSTANT_API_KEY and INSTANT_API_URL from the environment.
- * Falls back to anonymous mode (no key) and https://instant.dev.
+ * Falls back to anonymous mode (no key) and https://instanode.dev.
  */
 
 import * as child_process from "child_process";
@@ -10,7 +10,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 
-const DEFAULT_BASE_URL = "https://instant.dev";
+const DEFAULT_BASE_URL = "https://instanode.dev";
 
 export interface ClientOptions {
   apiKey?: string;
@@ -226,13 +226,13 @@ export class InstantClient {
     try {
       data = JSON.parse(text);
     } catch {
-      throw new Error(`instant.dev: non-JSON response (${resp.status}): ${text.slice(0, 200)}`);
+      throw new Error(`instanode.dev: non-JSON response (${resp.status}): ${text.slice(0, 200)}`);
     }
 
     if (!resp.ok) {
       const err = data as { error?: string; message?: string };
       throw new Error(
-        `instant.dev API error ${resp.status}: ${err.error ?? err.message ?? text.slice(0, 200)}`
+        `instanode.dev API error ${resp.status}: ${err.error ?? err.message ?? text.slice(0, 200)}`
       );
     }
 
@@ -432,13 +432,13 @@ export class InstantClient {
       try {
         data = JSON.parse(text);
       } catch {
-        throw new Error(`instant.dev: non-JSON response (${resp.status}): ${text.slice(0, 200)}`);
+        throw new Error(`instanode.dev: non-JSON response (${resp.status}): ${text.slice(0, 200)}`);
       }
 
       if (!resp.ok) {
         const err = data as { error?: string; message?: string };
         throw new Error(
-          `instant.dev API error ${resp.status}: ${err.error ?? err.message ?? text.slice(0, 200)}`
+          `instanode.dev API error ${resp.status}: ${err.error ?? err.message ?? text.slice(0, 200)}`
         );
       }
 
