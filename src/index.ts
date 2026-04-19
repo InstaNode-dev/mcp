@@ -19,6 +19,9 @@
  *                       only when pointing at a local dev cluster.
  */
 
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -32,9 +35,12 @@ import {
 
 const client = new InstantClient();
 
+const pkgPath = resolve(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+const pkgVersion = JSON.parse(readFileSync(pkgPath, "utf8")).version as string;
+
 const server = new McpServer({
   name: "instanode.dev",
-  version: "0.7.0",
+  version: pkgVersion,
 });
 
 /** Format an error thrown by the client into a short text block for the agent. */
