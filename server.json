@@ -1,25 +1,25 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.instanode-dev/mcp",
+  "name": "io.github.InstaNode-dev/mcp",
   "description": "Provision Postgres databases + webhooks from AI coding agents in one HTTP call.",
   "repository": {
     "url": "https://github.com/InstaNode-dev/mcp",
     "source": "github"
   },
-  "version": "0.7.1",
+  "version": "0.7.2",
   "websiteUrl": "https://instanode.dev",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@instanode/mcp",
-      "version": "0.7.1",
+      "version": "0.7.2",
       "transport": {
         "type": "stdio"
       },
       "environmentVariables": [
         {
           "name": "INSTANODE_TOKEN",
-          "description": "Optional bearer JWT for paid-tier callers. Mint at https://instanode.dev/dashboard → 'API token for CLI / agent'. Lifts the free-tier 5-per-subnet-per-day provisioning cap and auto-links new resources to your account. Leave unset to use the free tier anonymously.",
+          "description": "Optional bearer JWT for paid-tier callers. Mint at https://instanode.dev/dashboard \u2192 'API token for CLI / agent'. Lifts the free-tier 5-per-subnet-per-day provisioning cap and auto-links new resources to your account. Leave unset to use the free tier anonymously.",
           "isRequired": false,
           "isSecret": true,
           "format": "string"

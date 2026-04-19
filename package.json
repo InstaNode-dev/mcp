@@ -1,6 +1,6 @@
 {
   "name": "@instanode/mcp",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "MCP server for instanode.dev \u2014 lets AI coding agents provision ephemeral Postgres databases and webhook receivers over HTTPS, with optional bearer-token auth for paid users.",
   "keywords": [
     "mcp",
@@ -50,5 +50,5 @@
   "engines": {
     "node": ">=18"
   },
-  "mcpName": "io.github.instanode-dev/mcp"
+  "mcpName": "io.github.InstaNode-dev/mcp"
 }
