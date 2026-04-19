@@ -1,27 +1,43 @@
 {
-  "name": "@instant/mcp",
-  "version": "0.6.0",
-  "description": "MCP server for instanode.dev — lets AI agents provision databases, caches, queues, storage, webhooks, and deploy apps and stacks without human input",
+  "name": "@instanode/mcp",
+  "version": "0.7.0",
+  "description": "MCP server for instanode.dev — lets AI coding agents provision ephemeral Postgres databases and webhook receivers over HTTPS, with optional bearer-token auth for paid users.",
   "keywords": [
     "mcp",
+    "claude",
+    "cursor",
+    "windsurf",
     "instanode.dev",
-    "infrastructure",
-    "provisioning"
+    "postgres",
+    "provisioning",
+    "ai-agent",
+    "database"
   ],
+  "author": "instanode.dev <admin@instanode.dev>",
   "license": "MIT",
+  "homepage": "https://instanode.dev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/InstaNode-dev/mcp"
+  },
+  "bugs": {
+    "email": "admin@instanode.dev"
+  },
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "instant-mcp": "dist/index.js"
+    "instanode-mcp": "dist/index.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
     "start": "node dist/index.js",
-    "test": "node --test dist/index.test.js",
+    "test": "bash test.sh",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {

@@ -1,613 +1,327 @@
 #!/usr/bin/env node
 /**
- * @instant/mcp — MCP server for instanode.dev
+ * @instanode/mcp — MCP server for instanode.dev
  *
- * Exposes tools to AI agents (Claude Code, etc.):
+ * Exposes tools to AI coding agents (Claude Code, Cursor, Windsurf, etc.):
  *
- *   list_my_resources      — list all provisioned resources
- *   provision_database     — provision a Postgres + pgvector database
- *   provision_cache        — provision a Redis cache instance
- *   provision_document_db  — provision a MongoDB document database
- *   provision_queue        — provision a NATS JetStream queue
- *   provision_storage      — provision an S3-compatible object storage prefix
- *   provision_webhook      — provision a webhook receiver URL
- *   deploy_app             — deploy a containerized app to instanode.dev hosting
- *   deploy_stack           — deploy a multi-service stack from an instant.yaml manifest
+ *   create_postgres    — provision an ephemeral Postgres database (with pgvector)
+ *   create_webhook     — provision an inbound webhook receiver URL
+ *   list_resources     — list resources on the caller's account (requires INSTANODE_TOKEN)
+ *   claim_token        — attach an anonymous token to the caller's account
+ *   delete_resource    — permanently delete a resource (paid tier only)
+ *   get_api_token      — mint a fresh bearer token for CLI / agent usage
  *
- * Install globally for Claude Code:
- *   npx @instant/mcp
- *
- * ~/.claude/settings.json:
- *   {
- *     "mcpServers": {
- *       "instant": {
- *         "command": "npx",
- *         "args": ["@instant/mcp"]
- *       }
- *     }
- *   }
+ * Environment:
+ *   INSTANODE_TOKEN     Optional. Bearer JWT from https://instanode.dev/dashboard.
+ *                       Required for list_resources, claim_token, delete_resource,
+ *                       get_api_token. Unlocks paid-tier semantics on create_*.
+ *   INSTANODE_API_URL   Optional. Defaults to https://api.instanode.dev. Override
+ *                       only when pointing at a local dev cluster.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { InstantClient } from "./client.js";
+import {
+  ApiError,
+  AuthRequiredError,
+  InstantClient,
+  type ProvisionLimits,
+  type Resource,
+} from "./client.js";
 
 const client = new InstantClient();
 
 const server = new McpServer({
   name: "instanode.dev",
-  version: "0.6.0",
+  version: "0.7.0",
 });
 
-// ── Tool: list_my_resources ───────────────────────────────────────────────────
+/** Format an error thrown by the client into a short text block for the agent. */
+function formatError(err: unknown): string {
+  if (err instanceof AuthRequiredError) {
+    return err.message;
+  }
+  if (err instanceof ApiError) {
+    if (err.status === 401) {
+      return (
+        "Request rejected (401 unauthorized). " +
+        "Mint a token at https://instanode.dev/dashboard and set INSTANODE_TOKEN in your MCP server env."
+      );
+    }
+    if (err.status === 403 && err.code === "paid_tier_only") {
+      const upgrade = err.upgradeURL ?? "https://instanode.dev/pricing.html";
+      return `Free-tier resource cannot be deleted — it will auto-expire in 24h.\nUpgrade for hard-delete: ${upgrade}`;
+    }
+    if (err.status === 429) {
+      return (
+        "Rate limited (5 anonymous provisions/day per /24 subnet). " +
+        "Set INSTANODE_TOKEN to a paid bearer to remove the cap."
+      );
+    }
+    if (err.code) {
+      return `instanode.dev error (${err.status} ${err.code}): ${err.message}`;
+    }
+    return `instanode.dev error (${err.status}): ${err.message}`;
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  return `instanode.dev error: ${msg}`;
+}
+
+function textResult(text: string) {
+  return { content: [{ type: "text" as const, text }] };
+}
+
+function formatLimits(limits: ProvisionLimits | undefined): string[] {
+  const lines: string[] = [];
+  if (!limits) return lines;
+  if (typeof limits.storage_mb === "number") lines.push(`Storage: ${limits.storage_mb} MB`);
+  if (typeof limits.connections === "number") lines.push(`Max connections: ${limits.connections}`);
+  if (typeof limits.requests_stored === "number") lines.push(`Requests stored: ${limits.requests_stored}`);
+  if (typeof limits.expires_in === "string") lines.push(`Expires in: ${limits.expires_in}`);
+  return lines;
+}
+
+// ── Tool: create_postgres ─────────────────────────────────────────────────────
 
 server.tool(
-  "list_my_resources",
-  `List all instanode.dev resources provisioned for the authenticated team.
+  "create_postgres",
+  `Provision a fresh Postgres database on instanode.dev. pgvector is pre-installed.
 
-Requires INSTANT_API_KEY to be set in the environment. Without a key, returns an
-error explaining how to authenticate.
+Returns a standard postgres:// connection URL that any driver can use directly
+as DATABASE_URL — no wrapper SDK, no setup. The 'name' field is required (the
+human label surfaced on the dashboard).
 
-Returns a table of resources with their type, token, status, name, tier, and
-expiry time. Useful for auditing what infrastructure is currently provisioned.`,
-  {},
-  async () => {
-    if (!process.env["INSTANT_API_KEY"]) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: [
-              "INSTANT_API_KEY is not set — cannot list authenticated resources.",
-              "",
-              "To authenticate:",
-              "  1. Sign up at https://instanode.dev/start",
-              "  2. Get your API key from the dashboard",
-              "  3. Set INSTANT_API_KEY in your environment or pass it to the MCP server config",
-              "",
-              "Anonymous resources (provisioned without a key) expire after 24h and cannot",
-              "be listed here — they are tracked by the token embedded in your code.",
-            ].join("\n"),
-          },
-        ],
-      };
-    }
+Without INSTANODE_TOKEN: free tier — 10 MB, 2 connections, expires in 24h,
+capped at 5 provisions/day per /24 subnet.
+With INSTANODE_TOKEN (paid): 500 MB, 5 connections, permanent, no subnet cap.
 
-    const result = await client.listResources();
-
-    if (result.total === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "No resources provisioned for this team yet.\n\nUse a provision_* tool (e.g. provision_database) to create resources.",
-          },
-        ],
-      };
-    }
-
-    const rows = result.items.map((r) => {
-      const parts = [
-        `[${r.resource_type}] ${r.token}`,
-        `  status:  ${r.status}`,
-        `  tier:    ${r.tier}`,
+Store the connection_url in an env var (DATABASE_URL); do not hardcode it.`,
+  {
+    name: z
+      .string()
+      .min(1)
+      .max(64)
+      .describe(
+        "Human-readable label for this database (1–64 chars). Example: 'prospector-agent' or 'test-pgpid-123'."
+      ),
+  },
+  async ({ name }) => {
+    try {
+      const result = await client.createPostgres(name);
+      const lines = [
+        `Postgres database provisioned.`,
+        `Token:          ${result.token}`,
+        `Name:           ${result.name ?? name}`,
+        `Tier:           ${result.tier}`,
+        `Connection URL: ${result.connection_url}`,
+        ...formatLimits(result.limits),
       ];
-      if (r.name) parts.push(`  name:    ${r.name}`);
-      if (r.expires_at) parts.push(`  expires: ${r.expires_at}`);
-      if (r.cloud_vendor) parts.push(`  cloud:   ${r.cloud_vendor}`);
-      return parts.join("\n");
-    });
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: [
-            `${result.total} resource(s) provisioned:`,
-            "",
-            ...rows,
-          ].join("\n"),
-        },
-      ],
-    };
-  }
-);
-
-// ── Tool: provision_cache ─────────────────────────────────────────────────────
-
-server.tool(
-  "provision_cache",
-  `Provision a Redis cache instance on instanode.dev.
-
-Returns a connection_url the caller can use immediately with any Redis client.
-Anonymous (no API key): free tier, expires in 24h, limited memory.
-Authenticated (INSTANT_API_KEY set): tied to your team's plan.
-
-The connection_url is only returned once — store it securely (e.g. as an env var
-or in your secrets manager). Use list_my_resources to see provisioned caches.`,
-  {
-    name: z
-      .string()
-      .optional()
-      .describe(
-        "Optional human-readable label for this cache instance. E.g. 'session-cache'."
-      ),
-  },
-  async ({ name }) => {
-    let result;
-    try {
-      result = await client.provisionCache({ name });
+      if (result.note) lines.push(`Note: ${result.note}`);
+      lines.push(
+        ``,
+        `Use directly as DATABASE_URL (add .env to .gitignore):`,
+        `  DATABASE_URL=${result.connection_url}`,
+        ``,
+        `pgvector is ready — no CREATE EXTENSION needed.`
+      );
+      return textResult(lines.join("\n"));
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("service_disabled")) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: [
-                "Redis provisioning is not yet available on this server.",
-                "Visit https://instanode.dev to use the hosted service.",
-              ].join("\n"),
-            },
-          ],
-        };
-      }
-      throw err;
+      return textResult(formatError(err));
     }
-
-    const lines = [
-      `Redis cache provisioned.`,
-      `Token: ${result.token}`,
-      `Connection URL: ${result.connection_url}`,
-      `Tier: ${result.tier}`,
-    ];
-    if (result.name) lines.push(`Name: ${result.name}`);
-    if (result.note) lines.push(`Note: ${result.note}`);
-    if (result.upgrade) lines.push(`Upgrade: ${result.upgrade}`);
-    lines.push(
-      ``,
-      `Store the connection_url securely — it won't be shown again.`,
-      `Connect with any Redis client:`,
-      `  redis-cli -u "${result.connection_url}"`
-    );
-    return { content: [{ type: "text", text: lines.join("\n") }] };
   }
 );
 
-// ── Tool: provision_document_db ───────────────────────────────────────────────
+// ── Tool: create_webhook ──────────────────────────────────────────────────────
 
 server.tool(
-  "provision_document_db",
-  `Provision a MongoDB document database on instanode.dev.
+  "create_webhook",
+  `Provision an inbound webhook receiver URL on instanode.dev.
 
-Returns a connection_url the caller can use immediately with any MongoDB driver.
-Anonymous (no API key): free tier, expires in 24h, limited storage.
-Authenticated (INSTANT_API_KEY set): tied to your team's plan.
+Returns a receive_url that accepts any HTTP method from any sender and stores
+each request (method, headers, body, received_at). GET the same URL to pull
+back the stored log. The 'name' field is required.
 
-The connection_url is only returned once — store it securely.`,
-  {
-    name: z
-      .string()
-      .optional()
-      .describe(
-        "Optional human-readable label for this database. E.g. 'app-db'."
-      ),
-  },
-  async ({ name }) => {
-    let result;
-    try {
-      result = await client.provisionDocumentDB({ name });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("service_disabled")) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: [
-                "MongoDB provisioning is not yet available on this server.",
-                "Visit https://instanode.dev to use the hosted service.",
-              ].join("\n"),
-            },
-          ],
-        };
-      }
-      throw err;
-    }
-
-    const lines = [
-      `MongoDB database provisioned.`,
-      `Token: ${result.token}`,
-      `Connection URL: ${result.connection_url}`,
-      `Tier: ${result.tier}`,
-    ];
-    if (result.name) lines.push(`Name: ${result.name}`);
-    if (result.note) lines.push(`Note: ${result.note}`);
-    if (result.upgrade) lines.push(`Upgrade: ${result.upgrade}`);
-    lines.push(
-      ``,
-      `Store the connection_url securely — it won't be shown again.`,
-      `Connect with mongosh:`,
-      `  mongosh "${result.connection_url}"`
-    );
-    return { content: [{ type: "text", text: lines.join("\n") }] };
-  }
-);
-
-// ── Tool: provision_database ──────────────────────────────────────────────────
-
-server.tool(
-  "provision_database",
-  `Provision a PostgreSQL database (with pgvector) using instanode.dev. Returns a ready-to-use connection string. No account required — anonymous resources work immediately, expire after 24h unless claimed.`,
-  {
-    name: z
-      .string()
-      .optional()
-      .describe(
-        "Human-readable label for this database instance, e.g. 'my-app-dev'"
-      ),
-  },
-  async ({ name }) => {
-    let result;
-    try {
-      result = await client.provisionDatabase({ name });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("service_disabled")) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: [
-                "PostgreSQL provisioning is not yet available on this server.",
-                "Visit https://instanode.dev to use the hosted service.",
-              ].join("\n"),
-            },
-          ],
-        };
-      }
-      throw err;
-    }
-
-    const lines = [
-      `Database provisioned.`,
-      `Token: ${result.token}`,
-      `Connection URL: ${result.connection_url}`,
-      `Tier: ${result.tier}`,
-    ];
-    const limits = result.limits as { storage_mb?: number; connections?: number };
-    if (limits.storage_mb !== undefined) lines.push(`Storage: ${limits.storage_mb} MB`);
-    if (limits.connections !== undefined) lines.push(`Max connections: ${limits.connections}`);
-    if (result.expires_in) lines.push(`Expires in: ${result.expires_in}`);
-    if (result.note) lines.push(`Note: ${result.note}`);
-    if (result.upgrade) lines.push(`Upgrade: ${result.upgrade}`);
-    lines.push(
-      ``,
-      `Add to your .env:`,
-      `  DATABASE_URL=${result.connection_url}`
-    );
-    return { content: [{ type: "text", text: lines.join("\n") }] };
-  }
-);
-
-// ── Tool: provision_queue ─────────────────────────────────────────────────────
-
-server.tool(
-  "provision_queue",
-  `Provision a NATS JetStream message queue using instanode.dev. Returns a ready-to-use nats:// connection string. No account required — anonymous resources work immediately, expire after 24h unless claimed.`,
-  {
-    name: z
-      .string()
-      .optional()
-      .describe(
-        "Human-readable label for this queue instance, e.g. 'my-app-events'"
-      ),
-  },
-  async ({ name }) => {
-    let result;
-    try {
-      result = await client.provisionQueue({ name });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("service_disabled")) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: [
-                "NATS JetStream provisioning is not yet available on this server.",
-                "Visit https://instanode.dev to use the hosted service.",
-              ].join("\n"),
-            },
-          ],
-        };
-      }
-      throw err;
-    }
-
-    const lines = [
-      `Queue provisioned.`,
-      `Token: ${result.token}`,
-      `Connection URL: ${result.connection_url}`,
-      `Tier: ${result.tier}`,
-    ];
-    const limits = result.limits as { storage_mb?: number };
-    if (limits.storage_mb !== undefined) lines.push(`Storage: ${limits.storage_mb} MB`);
-    if (result.expires_in) lines.push(`Expires in: ${result.expires_in}`);
-    if (result.note) lines.push(`Note: ${result.note}`);
-    if (result.upgrade) lines.push(`Upgrade: ${result.upgrade}`);
-    lines.push(
-      ``,
-      `Add to your .env:`,
-      `  NATS_URL=${result.connection_url}`
-    );
-    return { content: [{ type: "text", text: lines.join("\n") }] };
-  }
-);
-
-// ── Tool: provision_storage ───────────────────────────────────────────────────
-
-server.tool(
-  "provision_storage",
-  `Provision an S3-compatible object storage prefix on instanode.dev.
-
-Returns S3 credentials (endpoint, bucket, prefix, access_key_id, secret_access_key)
-scoped to a per-token prefix within a shared bucket. Works with any S3-compatible
-client (AWS SDK, boto3, rclone, etc.).
-
-Anonymous (no API key): free tier, 10 MB, expires in 24h.
-Authenticated (INSTANT_API_KEY set): tied to your team's plan.
-
-Store the secret_access_key securely — it is only returned once.`,
-  {
-    name: z
-      .string()
-      .optional()
-      .describe(
-        "Optional human-readable label for this storage prefix. E.g. 'user-uploads'."
-      ),
-  },
-  async ({ name }) => {
-    let result;
-    try {
-      result = await client.provisionStorage({ name });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("service_disabled")) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: [
-                "Object storage provisioning is not yet available on this server.",
-                "Visit https://instanode.dev to use the hosted service.",
-              ].join("\n"),
-            },
-          ],
-        };
-      }
-      throw err;
-    }
-
-    const lines = [
-      `Object storage provisioned.`,
-      `Token:             ${result.token}`,
-      `Endpoint:          ${result.endpoint}`,
-      `Bucket:            ${result.bucket}`,
-      `Prefix:            ${result.prefix}`,
-      `Access Key ID:     ${result.access_key_id}`,
-      `Secret Access Key: ${result.secret_access_key}`,
-      `Tier:              ${result.tier}`,
-    ];
-    const limits = result.limits as { storage_mb?: number };
-    if (limits.storage_mb !== undefined) lines.push(`Storage: ${limits.storage_mb} MB`);
-    if (result.expires_in) lines.push(`Expires in: ${result.expires_in}`);
-    if (result.note) lines.push(`Note: ${result.note}`);
-    if (result.upgrade) lines.push(`Upgrade: ${result.upgrade}`);
-    lines.push(
-      ``,
-      `Add to your .env:`,
-      `  S3_ENDPOINT=${result.endpoint}`,
-      `  S3_BUCKET=${result.bucket}`,
-      `  S3_PREFIX=${result.prefix}`,
-      `  AWS_ACCESS_KEY_ID=${result.access_key_id}`,
-      `  AWS_SECRET_ACCESS_KEY=${result.secret_access_key}`,
-      ``,
-      `Store the secret — it won't be shown again.`
-    );
-    return { content: [{ type: "text", text: lines.join("\n") }] };
-  }
-);
-
-// ── Tool: provision_webhook ───────────────────────────────────────────────────
-
-server.tool(
-  "provision_webhook",
-  `Provision a webhook receiver URL on instanode.dev.
-
-Returns a receive_url that accepts any HTTP method from any sender. Payloads are
-stored and retrievable via the instanode.dev dashboard or API.
-
-Useful for: testing webhooks locally, inspecting Stripe/GitHub/Slack payloads
+Useful for: testing Stripe/GitHub/Slack webhooks locally, inspecting payloads
 during development, building integrations without exposing a local port.
 
-Anonymous (no API key): stores up to 100 requests, expires in 24h.
-Authenticated (INSTANT_API_KEY set): tied to your team's plan with higher limits.`,
+Without INSTANODE_TOKEN: free tier — up to 100 requests stored, 24h TTL.
+With INSTANODE_TOKEN (paid): 1000 stored, permanent.`,
   {
     name: z
       .string()
-      .optional()
+      .min(1)
+      .max(64)
       .describe(
-        "Optional human-readable label for this receiver. E.g. 'stripe-events'."
+        "Human-readable label for this receiver (1–64 chars). Example: 'stripe-sandbox'."
       ),
   },
   async ({ name }) => {
-    let result;
     try {
-      result = await client.provisionWebhook({ name });
+      const result = await client.createWebhook(name);
+      const lines = [
+        `Webhook receiver provisioned.`,
+        `Token:       ${result.token}`,
+        `Name:        ${result.name ?? name}`,
+        `Tier:        ${result.tier}`,
+        `Receive URL: ${result.receive_url}`,
+        ...formatLimits(result.limits),
+      ];
+      if (result.note) lines.push(`Note: ${result.note}`);
+      lines.push(
+        ``,
+        `Point any provider at the receive_url; GET it to pull stored requests:`,
+        `  curl -X POST ${result.receive_url} -d '{"event":"test"}'`,
+        `  curl ${result.receive_url}`
+      );
+      return textResult(lines.join("\n"));
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("service_disabled")) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: [
-                "Webhook receiver provisioning is not yet available on this server.",
-                "Visit https://instanode.dev to use the hosted service.",
-              ].join("\n"),
-            },
-          ],
-        };
-      }
-      throw err;
+      return textResult(formatError(err));
     }
-
-    const lines = [
-      `Webhook receiver provisioned.`,
-      `Token:       ${result.token}`,
-      `Receive URL: ${result.receive_url}`,
-      `Tier:        ${result.tier}`,
-    ];
-    if (result.name) lines.push(`Name: ${result.name}`);
-    const limits = result.limits as { requests_stored?: number };
-    if (limits.requests_stored !== undefined) lines.push(`Requests stored: ${limits.requests_stored}`);
-    if (result.expires_in) lines.push(`Expires in: ${result.expires_in}`);
-    if (result.note) lines.push(`Note: ${result.note}`);
-    if (result.upgrade) lines.push(`Upgrade: ${result.upgrade}`);
-    lines.push(
-      ``,
-      `Point any service at the receive_url:`,
-      `  curl -X POST ${result.receive_url} -d '{"event":"test"}'`,
-      ``,
-      `View captured requests in the dashboard or via:`,
-      `  GET /api/v1/webhooks/${result.token}/requests  (requires INSTANT_API_KEY)`
-    );
-    return { content: [{ type: "text", text: lines.join("\n") }] };
   }
 );
 
-// ── Tool: deploy_app ──────────────────────────────────────────────────────────
+// ── Tool: list_resources ──────────────────────────────────────────────────────
 
 server.tool(
-  "deploy_app",
-  "Deploy a containerized app to instanode.dev hosting. The source directory must contain a Dockerfile. Returns the deployment ID and app URL once healthy.",
-  {
-    source_dir: z.string().optional().describe("Path to source directory containing Dockerfile (default: current directory '.')"),
-    name: z.string().optional().describe("Human-readable name for the deployment"),
-    port: z.number().int().min(1).max(65535).optional().describe("Port the app listens on (default: 8080)"),
-  },
-  async ({ source_dir = ".", name, port }) => {
-    let result;
-    try {
-      result = await client.deployApp({ sourceDir: source_dir, name, port });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("service_disabled")) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: [
-                "App deployment is not yet available on this server.",
-                "Visit https://instanode.dev to use the hosted service.",
-              ].join("\n"),
-            },
-          ],
-        };
-      }
-      throw err;
-    }
+  "list_resources",
+  `List resources on the caller's instanode.dev account, newest first.
 
-    const lines = [
-      `App deployment submitted.`,
-      `Deployment ID: ${result.id}`,
-      `App ID:        ${result.app_id}`,
-      `Token:         ${result.token}`,
-      `Status:        ${result.status}`,
-      `Tier:          ${result.tier}`,
-    ];
-    if (result.app_url) lines.push(`App URL:       ${result.app_url}`);
-    if (result.note) lines.push(`Note: ${result.note}`);
-    lines.push(
-      ``,
-      `Poll status at https://instanode.dev/dashboard or use GET /deploy/${result.id}`
-    );
-    return { content: [{ type: "text", text: lines.join("\n") }] };
+Requires INSTANODE_TOKEN to be set. Mint one at https://instanode.dev/dashboard.
+
+Returns each resource's type, token, tier, status, name, and expiry.`,
+  {},
+  async () => {
+    try {
+      const items: Resource[] = await client.listResources();
+      if (items.length === 0) {
+        return textResult(
+          "No resources on this account yet.\n\nUse create_postgres or create_webhook to provision one."
+        );
+      }
+      const rows = items.map((r) => {
+        const parts = [
+          `[${r.resource_type}] ${r.token}`,
+          `  tier:    ${r.tier}`,
+          `  status:  ${r.status}`,
+        ];
+        if (r.name) parts.push(`  name:    ${r.name}`);
+        if (r.expires_at) parts.push(`  expires: ${r.expires_at}`);
+        if (r.created_at) parts.push(`  created: ${r.created_at}`);
+        return parts.join("\n");
+      });
+      return textResult(
+        [`${items.length} resource(s) on this account:`, "", ...rows].join("\n")
+      );
+    } catch (err) {
+      return textResult(formatError(err));
+    }
   }
 );
 
-// ── Tool: deploy_stack ────────────────────────────────────────────────────────
+// ── Tool: claim_token ─────────────────────────────────────────────────────────
 
 server.tool(
-  "deploy_stack",
-  `Deploy a multi-service stack from an instant.yaml manifest. Reads the manifest from the current directory, creates Docker images for each service, and deploys them to instanode.dev infrastructure. All services share an isolated namespace and can communicate via service:// DNS.`,
+  "claim_token",
+  `Attach an anonymous token (returned by create_postgres / create_webhook) to
+the authenticated caller's account. Idempotent — re-claiming a token you
+already own returns the same payload.
+
+For paid callers, the resource's tier is upgraded to 'paid' and its expiry is
+cleared. For free callers, the resource stays anonymous-tier but is now
+visible on the dashboard.
+
+Requires INSTANODE_TOKEN.`,
   {
-    manifest_path: z
-      .string()
-      .optional()
-      .describe(
-        "Path to instant.yaml manifest file (default: ./instant.yaml)"
-      ),
     token: z
       .string()
-      .optional()
-      .describe(
-        "Authentication token from instanode.dev (required for authenticated deployments)"
-      ),
+      .min(1)
+      .describe("Resource token (UUID) returned by create_postgres or create_webhook."),
   },
-  async ({ manifest_path, token }) => {
-    const manifestPath = manifest_path ?? "./instant.yaml";
-    let result;
+  async ({ token }) => {
     try {
-      result = await client.deployStack(manifestPath, undefined, token);
+      const result = await client.claimToken(token);
+      const lines = [
+        `Token claimed.`,
+        `Resource type: ${result.resource_type}`,
+        `Token:         ${result.token}`,
+        `Tier:          ${result.tier}`,
+        `Status:        ${result.status}`,
+      ];
+      if (result.name) lines.push(`Name: ${result.name}`);
+      return textResult(lines.join("\n"));
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("service_disabled")) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: [
-                "Stack deployment is not yet available on this server.",
-                "Visit https://instanode.dev to use the hosted service.",
-              ].join("\n"),
-            },
-          ],
-        };
-      }
-      throw err;
+      return textResult(formatError(err));
     }
+  }
+);
 
-    if (!result.ok) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: [
-              `Stack deployment failed.`,
-              result.error ? `Error: ${result.error}` : "",
-            ]
-              .filter(Boolean)
-              .join("\n"),
-          },
-        ],
-      };
-    }
+// ── Tool: delete_resource ─────────────────────────────────────────────────────
 
-    const lines = [
-      `Stack deployed successfully.`,
-      `Stack ID: ${result.stack_id}`,
-      `Slug:     ${result.slug}`,
-      `Status:   ${result.status}`,
-      ``,
-      `Services:`,
-    ];
-    for (const svc of result.services) {
-      lines.push(`  ${svc.name}: ${svc.status}${svc.app_url ? ` → ${svc.app_url}` : ""}`);
+server.tool(
+  "delete_resource",
+  `Permanently delete one of the caller's resources. Drops the underlying
+Postgres database (or clears the webhook's request log), then marks the row
+status='deleted'.
+
+Paid tier only. Free-tier resources auto-expire in 24h and cannot be deleted
+manually — the tool will surface the upgrade URL.
+
+Requires INSTANODE_TOKEN.`,
+  {
+    token: z
+      .string()
+      .min(1)
+      .describe("Resource token (UUID) to delete."),
+  },
+  async ({ token }) => {
+    try {
+      const result = await client.deleteResource(token);
+      const lines = [
+        `Resource deleted.`,
+        `Token:  ${result.token ?? token}`,
+        `Status: ${result.status ?? "deleted"}`,
+      ];
+      if (result.message) lines.push(`Message: ${result.message}`);
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
     }
-    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+);
+
+// ── Tool: get_api_token ───────────────────────────────────────────────────────
+
+server.tool(
+  "get_api_token",
+  `Mint a fresh 30-day bearer JWT for the authenticated caller and return it
+as plain text. The user should paste the returned token into their MCP
+server config as INSTANODE_TOKEN (or export it as an env var for CLI use).
+
+Requires an existing INSTANODE_TOKEN (or a session cookie, though session
+cookies aren't available in this transport). This is primarily useful for
+rotating an expiring token.`,
+  {},
+  async () => {
+    try {
+      const result = await client.getApiToken();
+      const lines = [
+        `New bearer token minted.`,
+        `Expires in: ${result.expires_in} seconds (~${Math.round(result.expires_in / 86400)} days)`,
+        ``,
+        `Token:`,
+        result.token,
+        ``,
+        `Set it in your MCP server config:`,
+        `  "env": { "INSTANODE_TOKEN": "<token above>" }`,
+        ``,
+        `Or export it in your shell:`,
+        `  export INSTANODE_TOKEN=<token above>`,
+      ];
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
+    }
   }
 );
 
