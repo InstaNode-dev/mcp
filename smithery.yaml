@@ -1,0 +1,31 @@
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    required: []
+    properties:
+      instanodeToken:
+        type: string
+        title: InstaNode API Token
+        description: |
+          Optional bearer JWT for paid-tier callers. Mint at
+          https://instanode.dev/dashboard under "API token for CLI / agent".
+          Lifts the free-tier 5-per-subnet-per-day provisioning cap and auto-
+          links new resources to your account. Leave empty to use the free tier
+          anonymously (10 MB / 2 connections / 24h TTL Postgres).
+      instanodeApiBase:
+        type: string
+        title: API Base URL
+        description: |
+          Override the API base URL. Defaults to https://api.instanode.dev.
+          Only change this for self-hosted InstaNode deployments.
+        default: https://api.instanode.dev
+  commandFunction: |-
+    (config) => ({
+      command: 'npx',
+      args: ['-y', '@instanode/mcp@latest'],
+      env: {
+        ...(config.instanodeToken ? { INSTANODE_TOKEN: config.instanodeToken } : {}),
+        ...(config.instanodeApiBase ? { INSTANODE_API_BASE: config.instanodeApiBase } : {})
+      }
+    })
