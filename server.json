@@ -1,0 +1,38 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.instanode-dev/mcp",
+  "description": "Provision ephemeral Postgres databases and webhook receivers from AI coding agents — one HTTP call, live connection URL back, pgvector pre-installed. Free 24h tier; paid Developer tier for permanent resources.",
+  "repository": {
+    "url": "https://github.com/InstaNode-dev/mcp",
+    "source": "github"
+  },
+  "version": "0.7.1",
+  "websiteUrl": "https://instanode.dev",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@instanode/mcp",
+      "version": "0.7.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "INSTANODE_TOKEN",
+          "description": "Optional bearer JWT for paid-tier callers. Mint at https://instanode.dev/dashboard → 'API token for CLI / agent'. Lifts the free-tier 5-per-subnet-per-day provisioning cap and auto-links new resources to your account. Leave unset to use the free tier anonymously.",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "INSTANODE_API_BASE",
+          "description": "Override the API base URL. Defaults to https://api.instanode.dev. Useful for self-hosted deployments.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string",
+          "default": "https://api.instanode.dev"
+        }
+      ]
+    }
+  ]
+}
