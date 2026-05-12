@@ -1,4 +1,12 @@
-# Publishing @instanode/mcp
+# Publishing instanode-mcp
+
+> **Note (2026-05-12):** the package name moved from the scoped
+> `@instanode/mcp` to unscoped `instanode-mcp` because the `@instanode`
+> npm org was never registered and the publish workflow was 404-ing on
+> every release. The unscoped name removes the org-setup blocker; the
+> install commands below reflect the new name. Historical references in
+> downstream READMEs / launch posts that still say `@instanode/mcp` should
+> be migrated when they're next touched.
 
 End-to-end checklist for pushing a new version out to every registry we
 care about. Do steps in order — smithery + the MCP registry both pull
@@ -34,13 +42,14 @@ npm whoami            # should print: instanode
 npm publish --access public
 ```
 
-The `--access public` flag is required for scoped packages (`@instanode/...`)
-that start life private by default on npm.
+`--access public` is harmless on an unscoped package (the flag was originally
+required when the name was scoped `@instanode/mcp`; kept here so the publish
+workflow doesn't have to branch on the name).
 
 Verify it landed:
 
 ```bash
-npm view @instanode/mcp version
+npm view instanode-mcp version
 ```
 
 ## 2. MCP Registry (registry.modelcontextprotocol.io)
@@ -98,7 +107,7 @@ appear at https://cursor.com/mcp within ~24 hours. No separate action.
 
 ```bash
 # Regular user install path (what a dev finds in Claude Code docs)
-npx -y @instanode/mcp@latest --version
+npx -y instanode-mcp@latest --version
 
 # Registry URL (should resolve to a listing page)
 open https://registry.modelcontextprotocol.io/v0/servers/io.github.instanode-dev/mcp

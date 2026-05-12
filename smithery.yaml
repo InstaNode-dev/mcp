@@ -23,7 +23,7 @@ startCommand:
   commandFunction: |-
     (config) => ({
       command: 'npx',
-      args: ['-y', '@instanode/mcp@latest'],
+      args: ['-y', 'instanode-mcp@latest'],
       env: {
         ...(config.instanodeToken ? { INSTANODE_TOKEN: config.instanodeToken } : {}),
         ...(config.instanodeApiBase ? { INSTANODE_API_BASE: config.instanodeApiBase } : {})

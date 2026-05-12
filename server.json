@@ -6,13 +6,13 @@
     "url": "https://github.com/InstaNode-dev/mcp",
     "source": "github"
   },
-  "version": "0.7.2",
+  "version": "0.8.0",
   "websiteUrl": "https://instanode.dev",
   "packages": [
     {
       "registryType": "npm",
-      "identifier": "@instanode/mcp",
-      "version": "0.7.2",
+      "identifier": "instanode-mcp",
+      "version": "0.8.0",
       "transport": {
         "type": "stdio"
       },

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * @instanode/mcp — MCP server for instanode.dev
+ * instanode-mcp — MCP server for instanode.dev
  *
  * Exposes tools to AI coding agents (Claude Code, Cursor, Windsurf, etc.):
  *
