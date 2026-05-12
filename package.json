@@ -1,7 +1,7 @@
 {
   "name": "@instanode/mcp",
-  "version": "0.7.3",
-  "description": "MCP server for instanode.dev \u2014 lets AI coding agents provision ephemeral Postgres databases and webhook receivers over HTTPS, with optional bearer-token auth for paid users.",
+  "version": "0.8.0",
+  "description": "MCP server for instanode.dev \u2014 lets AI coding agents provision ephemeral Postgres, Redis, MongoDB, NATS queues, S3-compatible object storage, and webhook receivers over HTTPS, with optional bearer-token auth for paid users.",
   "keywords": [
     "mcp",
     "claude",
@@ -9,6 +9,12 @@
     "windsurf",
     "instanode.dev",
     "postgres",
+    "redis",
+    "mongodb",
+    "nats",
+    "s3",
+    "object-storage",
+    "webhook",
     "provisioning",
     "ai-agent",
     "database"

@@ -33,14 +33,24 @@ echo "$RESP" | python3 -c "
 import sys, json
 d = json.loads(sys.stdin.read())
 tools = {t['name'] for t in d['result']['tools']}
-expected = {'create_postgres', 'create_webhook', 'list_resources', 'claim_token', 'delete_resource', 'get_api_token'}
+expected = {
+    'create_postgres', 'create_cache', 'create_nosql', 'create_queue',
+    'create_storage', 'create_webhook',
+    'claim_resource', 'claim_token',
+    'list_resources', 'delete_resource', 'get_api_token',
+}
 missing = expected - tools
 assert not missing, f'missing tools: {missing}'
-dead = {'provision_cache', 'provision_queue', 'provision_storage', 'provision_document_db', 'deploy_app', 'deploy_stack'}
+dead = {
+    'provision_cache', 'provision_queue', 'provision_storage',
+    'provision_document_db', 'deploy_app', 'deploy_stack',
+}
 still_there = dead & tools
 assert not still_there, f'dead tools still registered: {still_there}'
+extra = tools - expected
+assert not extra, f'unexpected tools registered: {extra}'
 " || fail "tools/list missing expected tools or carrying dead ones"
-pass "tools/list returns all 6 tools, no dead ones"
+pass "tools/list returns all 11 tools, no dead ones"
 
 # Test 3: list_resources — no token, should surface auth-required message
 LIST='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_resources","arguments":{}}}'
@@ -64,6 +74,30 @@ err = d.get('error') or (d.get('result') or {}).get('isError')
 assert err, f'expected a validation error, got: {d}'
 " || fail "create_postgres with empty name was accepted"
 pass "create_postgres rejects empty name"
+
+# Test 5: claim_resource is a pure helper — works without any API/network access.
+# Accepts a raw JWT and builds the dashboard claim URL.
+CLAIM='{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"claim_resource","arguments":{"upgrade_jwt":"ey.fake.jwt"}}}'
+RESP=$(printf "%s\n%s\n" "$INIT" "$CLAIM" | INSTANODE_API_URL="$BASE_URL" $MCP 2>/dev/null | tail -1)
+echo "$RESP" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+text = d['result']['content'][0]['text']
+assert '/start?t=ey.fake.jwt' in text, f'expected claim URL with JWT, got: {text}'
+assert 'instanode' in text, f'expected dashboard host in URL, got: {text}'
+" || fail "claim_resource did not build the expected claim URL"
+pass "claim_resource builds dashboard claim URL from raw JWT"
+
+# Test 6: claim_resource accepts a full /start?t= URL and re-extracts the JWT.
+CLAIM_URL='{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"claim_resource","arguments":{"upgrade_jwt":"https://instanode.dev/start?t=ey.url.jwt"}}}'
+RESP=$(printf "%s\n%s\n" "$INIT" "$CLAIM_URL" | INSTANODE_API_URL="$BASE_URL" $MCP 2>/dev/null | tail -1)
+echo "$RESP" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+text = d['result']['content'][0]['text']
+assert '/start?t=ey.url.jwt' in text, f'expected JWT extracted from URL, got: {text}'
+" || fail "claim_resource did not extract JWT from a full URL"
+pass "claim_resource extracts JWT from a full /start?t= URL"
 
 echo ""
 echo "All tests passed."
