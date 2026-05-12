@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Integration test for @instanode/mcp
+# Integration test for instanode-mcp
 # Usage: INSTANODE_API_URL=http://localhost:30080 ./test.sh
 set -euo pipefail
 
@@ -12,7 +12,7 @@ pass() { echo "PASS: $*"; }
 # Build first
 npm run build --silent
 
-echo "Testing @instanode/mcp against $BASE_URL"
+echo "Testing instanode-mcp against $BASE_URL"
 echo ""
 
 # Test 1: initialize

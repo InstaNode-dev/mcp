@@ -1,4 +1,4 @@
-# @instanode/mcp
+# instanode-mcp
 
 MCP server for [instanode.dev](https://instanode.dev). Lets AI coding agents
 (Claude Code, Cursor, Windsurf, Continue, etc.) provision the full bundle of
@@ -27,7 +27,7 @@ get the dashboard claim URL.
 ### Claude Code
 
 ```bash
-claude mcp add instanode -- npx -y @instanode/mcp@latest
+claude mcp add instanode -- npx -y instanode-mcp@latest
 ```
 
 To authenticate (unlock paid-tier limits and the account-management tools):
@@ -35,7 +35,7 @@ To authenticate (unlock paid-tier limits and the account-management tools):
 ```bash
 claude mcp add instanode \
   --env INSTANODE_TOKEN=<paste from https://instanode.dev/dashboard> \
-  -- npx -y @instanode/mcp@latest
+  -- npx -y instanode-mcp@latest
 ```
 
 ### Cursor
@@ -47,7 +47,7 @@ Add to `.cursor/mcp.json` (project) or `~/.cursor/mcp.json` (global):
   "mcpServers": {
     "instanode": {
       "command": "npx",
-      "args": ["-y", "@instanode/mcp@latest"],
+      "args": ["-y", "instanode-mcp@latest"],
       "env": {
         "INSTANODE_TOKEN": "<optional — paste from dashboard for paid tier>"
       }
@@ -65,7 +65,7 @@ Add to `~/.codeium/windsurf/mcp_config.json`:
   "mcpServers": {
     "instanode": {
       "command": "npx",
-      "args": ["-y", "@instanode/mcp@latest"],
+      "args": ["-y", "instanode-mcp@latest"],
       "env": {
         "INSTANODE_TOKEN": "<optional>"
       }
@@ -82,7 +82,7 @@ Add to your `~/.continue/config.yaml`:
 mcpServers:
   - name: instanode
     command: npx
-    args: ["-y", "@instanode/mcp@latest"]
+    args: ["-y", "instanode-mcp@latest"]
     env:
       INSTANODE_TOKEN: "<optional>"
 ```
