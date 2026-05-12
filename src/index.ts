@@ -614,7 +614,9 @@ rotating an expiring token.`,
 
 server.tool(
   "create_deploy",
-  `Deploy a containerized application on instanode.dev (POST /deploy/new).
+  `Create a new deploy. Optionally set \`private: true\` + \`allowed_ips: ['1.2.3.4', '10.0.0.0/8']\` to restrict access to specific IPs. Requires Pro tier or higher. Useful when an agent is asked to deploy a CRM, internal dashboard, or staging app that should only be reachable by the user.
+
+Deploys a containerized application on instanode.dev (POST /deploy/new).
 
 The agent base64-encodes a gzip tarball of the user's project (must contain a
 Dockerfile at the root), passes it as 'tarball_base64', and the API builds +
@@ -641,6 +643,10 @@ Env vars: 'env_vars' takes plaintext values or vault://env/KEY refs (the
 vault is per-team, per-env; rotate without redeploying). 'env_vars' and
 'resource_bindings' are merged before being sent to the API; on collision,
 'resource_bindings' wins.
+
+Private deploys: set 'private: true' and pass 'allowed_ips' (IPs or CIDR
+blocks) to restrict access at the Ingress. Pro tier or higher is required —
+hobby tier returns 402 with an agent_action prompting the user to upgrade.
 
 Requires INSTANODE_TOKEN (anonymous tier cannot deploy).`,
   {
@@ -681,6 +687,18 @@ Requires INSTANODE_TOKEN (anonymous tier cannot deploy).`,
       .describe(
         "Map of env var name → resource token UUID (e.g. { DATABASE_URL: '<postgres token>' }). The API resolves each token to its connection URL server-side. DO NOT pass raw connection URLs here — use create_postgres/create_cache/etc. to get tokens, then bind them."
       ),
+    private: z
+      .boolean()
+      .optional()
+      .describe(
+        "When true, the deploy is only reachable from IPs in 'allowed_ips'. Requires Pro tier or higher — anonymous and hobby callers get HTTP 402 with an agent_action prompting the user to upgrade. Use for CRMs, internal dashboards, staging apps."
+      ),
+    allowed_ips: z
+      .array(z.string().min(1))
+      .optional()
+      .describe(
+        "IP / CIDR allowlist enforced at the Ingress when 'private' is true. Examples: ['1.2.3.4', '10.0.0.0/8', '203.0.113.42/32']. Required when private=true; ignored otherwise. If Track A's backend lands with a renamed field (e.g. 'allowed_cidrs'), this MCP tool will surface the 400 verbatim — see PR body."
+      ),
   },
   async (params) => {
     try {
@@ -694,6 +712,13 @@ Requires INSTANODE_TOKEN (anonymous tier cannot deploy).`,
           : `URL:            (pending — poll get_deployment until status="running")`,
         `Build logs:     ${result.build_logs_url}`,
       ];
+      if (result.item.private) {
+        lines.push(`Private:        true`);
+        const ips = result.item.allowed_ips ?? params.allowed_ips ?? [];
+        if (ips.length > 0) {
+          lines.push(`Allowed IPs:    ${ips.join(", ")}`);
+        }
+      }
       appendUpgradeBlock(lines, result);
       lines.push(
         ``,
@@ -736,6 +761,10 @@ Requires INSTANODE_TOKEN.`,
           `  port:   ${d.port}`,
         ];
         if (d.environment) parts.push(`  env:    ${d.environment}`);
+        if (d.private) {
+          const ips = d.allowed_ips && d.allowed_ips.length > 0 ? ` (${d.allowed_ips.join(", ")})` : "";
+          parts.push(`  private: true${ips}`);
+        }
         if (d.created_at) parts.push(`  created: ${d.created_at}`);
         if (d.error) parts.push(`  error:  ${d.error}`);
         return parts.join("\n");
@@ -778,6 +807,12 @@ Requires INSTANODE_TOKEN.`,
         `Port:        ${d.port}`,
       ];
       if (d.environment) lines.push(`Environment: ${d.environment}`);
+      if (d.private) {
+        lines.push(`Private:     true`);
+        if (d.allowed_ips && d.allowed_ips.length > 0) {
+          lines.push(`Allowed IPs: ${d.allowed_ips.join(", ")}`);
+        }
+      }
       if (d.error) lines.push(`Error:       ${d.error}`);
       if (d.created_at) lines.push(`Created:     ${d.created_at}`);
       if (d.updated_at) lines.push(`Updated:     ${d.updated_at}`);
