@@ -8,9 +8,20 @@
  * Bearer auth is read from INSTANODE_TOKEN on every call so the user can
  * rotate the token without restarting the MCP process. Anonymous callers
  * simply leave the env var unset.
+ *
+ * Today's API surface (all live):
+ *   POST /db/new       — Postgres
+ *   POST /cache/new    — Redis
+ *   POST /nosql/new    — MongoDB
+ *   POST /queue/new    — NATS JetStream
+ *   POST /storage/new  — S3-compatible bucket
+ *   POST /webhook/new  — Webhook receiver
+ *   GET  /api/me/resources, POST /api/me/claim, DELETE /api/me/resources/{token}
+ *   GET  /api/me/token
  */
 
 const DEFAULT_BASE_URL = "https://api.instanode.dev";
+const DEFAULT_DASHBOARD_URL = "https://instanode.dev";
 
 export interface ClientOptions {
   baseURL?: string;
@@ -35,26 +46,60 @@ export interface ProvisionLimits {
   [key: string]: unknown;
 }
 
-export interface DatabaseProvisionResult {
+/**
+ * Shared fields every /<resource>/new response carries. Some resources have
+ * type-specific extras (receive_url for webhook, endpoint/access_key_id/etc
+ * for storage).
+ */
+export interface ProvisionResultBase {
   ok: boolean;
   id: string;
   token: string;
   name?: string;
-  connection_url: string;
   tier: string;
-  limits: ProvisionLimits;
+  limits?: ProvisionLimits;
+  /** Human-readable CTA the agent should surface verbatim. */
   note?: string;
+  /** https://instanode.dev/start?t=<jwt> — the dashboard claim URL. */
+  upgrade?: string;
+  /** Raw upgrade JWT (for callers that want to build their own claim URL). */
+  upgrade_jwt?: string;
+  expires_at?: string | null;
+  env?: string;
 }
 
-export interface WebhookProvisionResult {
-  ok: boolean;
-  id: string;
-  token: string;
-  name?: string;
+export interface DatabaseProvisionResult extends ProvisionResultBase {
+  /** postgres://... connection string, drop-in DATABASE_URL. */
+  connection_url: string;
+}
+
+export interface CacheProvisionResult extends ProvisionResultBase {
+  /** redis://user:pass@host:port — drop-in REDIS_URL. */
+  connection_url: string;
+}
+
+export interface NoSQLProvisionResult extends ProvisionResultBase {
+  /** mongodb://user:pass@host:port/db — drop-in MONGODB_URI. */
+  connection_url: string;
+}
+
+export interface QueueProvisionResult extends ProvisionResultBase {
+  /** nats://user:pass@host:port — drop-in NATS_URL. JetStream enabled. */
+  connection_url: string;
+}
+
+export interface StorageProvisionResult extends ProvisionResultBase {
+  /** Public bucket URL prefix, e.g. https://nyc3.digitaloceanspaces.com/instant-shared/<prefix>/ */
+  connection_url: string;
+  endpoint: string;
+  access_key_id: string;
+  secret_access_key: string;
+  prefix: string;
+}
+
+export interface WebhookProvisionResult extends ProvisionResultBase {
+  /** Public URL: POST anything to it, GET it to retrieve the captured log. */
   receive_url: string;
-  tier: string;
-  limits: ProvisionLimits;
-  note?: string;
 }
 
 export interface ClaimResult {
@@ -120,6 +165,18 @@ export class InstantClient {
     ).replace(/\/$/, "");
   }
 
+  /**
+   * Public dashboard URL — where the agent should direct the user to claim an
+   * anonymous resource. Reads INSTANODE_DASHBOARD_URL on every call so the user
+   * can override for staging without restarting the MCP process.
+   */
+  dashboardURL(): string {
+    return (process.env["INSTANODE_DASHBOARD_URL"] ?? DEFAULT_DASHBOARD_URL).replace(
+      /\/$/,
+      ""
+    );
+  }
+
   /** Read the bearer token fresh from the environment on every call. */
   private bearerToken(): string | undefined {
     const tok = process.env["INSTANODE_TOKEN"];
@@ -129,7 +186,7 @@ export class InstantClient {
   private headers(): Record<string, string> {
     const h: Record<string, string> = {
       "Content-Type": "application/json",
-      "User-Agent": "instanode-mcp/0.7.0",
+      "User-Agent": "instanode-mcp/0.8.0",
     };
     const tok = this.bearerToken();
     if (tok) {
@@ -195,6 +252,26 @@ export class InstantClient {
   /** POST /db/new — provision a Postgres database. `name` is required. */
   async createPostgres(name: string): Promise<DatabaseProvisionResult> {
     return this.request<DatabaseProvisionResult>("POST", "/db/new", { name });
+  }
+
+  /** POST /cache/new — provision a Redis cache. `name` is required. */
+  async createCache(name: string): Promise<CacheProvisionResult> {
+    return this.request<CacheProvisionResult>("POST", "/cache/new", { name });
+  }
+
+  /** POST /nosql/new — provision a MongoDB database. `name` is required. */
+  async createNoSQL(name: string): Promise<NoSQLProvisionResult> {
+    return this.request<NoSQLProvisionResult>("POST", "/nosql/new", { name });
+  }
+
+  /** POST /queue/new — provision a NATS JetStream queue. `name` is required. */
+  async createQueue(name: string): Promise<QueueProvisionResult> {
+    return this.request<QueueProvisionResult>("POST", "/queue/new", { name });
+  }
+
+  /** POST /storage/new — provision an S3-compatible object storage bucket prefix. `name` is required. */
+  async createStorage(name: string): Promise<StorageProvisionResult> {
+    return this.request<StorageProvisionResult>("POST", "/storage/new", { name });
   }
 
   /** POST /webhook/new — provision a webhook receiver. `name` is required. */
