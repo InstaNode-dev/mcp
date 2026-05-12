@@ -130,6 +130,21 @@ export interface Deployment {
   created_at?: string;
   updated_at?: string;
   team_id?: string;
+  /**
+   * Private deploy flag — when true, the deploy's Ingress only accepts traffic
+   * from `allowed_ips`. Pro tier or higher required (anonymous + hobby are 402).
+   */
+  private?: boolean;
+  /**
+   * IP / CIDR allowlist enforced at the Ingress when `private` is true.
+   * Strings like "1.2.3.4" or "10.0.0.0/8". Empty / undefined when
+   * `private` is false.
+   *
+   * Track A's backend contract uses `allowed_ips`. If Track A ends up renaming
+   * to `allowed_cidrs`, reconcile post-merge with a one-line schema rename
+   * (see PR body).
+   */
+  allowed_ips?: string[];
 }
 
 /**
@@ -200,6 +215,19 @@ export interface CreateDeployParams {
    * tool params, which the agent host may log.
    */
   resource_bindings?: Record<string, string>;
+  /**
+   * Private deploy flag. When true, the Ingress only accepts traffic from
+   * `allowed_ips`. Requires Pro tier or higher (api returns 402 on hobby
+   * with an `agent_action` upgrade prompt).
+   */
+  private?: boolean;
+  /**
+   * IP / CIDR allowlist (required when `private=true`). Strings like
+   * "1.2.3.4" or "10.0.0.0/8". The MCP client forwards this as-is to
+   * Track A's backend contract; if Track A ships with a slightly different
+   * shape (e.g. `allowed_cidrs`), reconcile post-merge.
+   */
+  allowed_ips?: string[];
 }
 
 export interface ClaimResult {
@@ -286,7 +314,7 @@ export class InstantClient {
   private headers(): Record<string, string> {
     const h: Record<string, string> = {
       "Content-Type": "application/json",
-      "User-Agent": "instanode-mcp/0.9.0",
+      "User-Agent": "instanode-mcp/0.10.0",
     };
     const tok = this.bearerToken();
     if (tok) {
@@ -301,7 +329,7 @@ export class InstantClient {
    */
   private authHeaders(): Record<string, string> {
     const h: Record<string, string> = {
-      "User-Agent": "instanode-mcp/0.9.0",
+      "User-Agent": "instanode-mcp/0.10.0",
     };
     const tok = this.bearerToken();
     if (tok) {
@@ -509,6 +537,17 @@ export class InstantClient {
     if (params.name) form.append("name", params.name);
     if (typeof params.port === "number") form.append("port", String(params.port));
     if (params.env) form.append("env", params.env);
+
+    // Private deploy + IP allowlist (Track A backend contract). Booleans and
+    // arrays go through multipart as strings — the api parses them back. We
+    // intentionally forward `private` even when false so the server can
+    // distinguish "explicitly public" from "field omitted".
+    if (typeof params.private === "boolean") {
+      form.append("private", params.private ? "true" : "false");
+    }
+    if (params.allowed_ips && params.allowed_ips.length > 0) {
+      form.append("allowed_ips", JSON.stringify(params.allowed_ips));
+    }
 
     // Merge resource_bindings into env_vars. The api treats every value
     // either as plaintext, a vault://env/KEY ref, or — for deploy bindings —
