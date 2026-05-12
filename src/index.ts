@@ -10,6 +10,8 @@
  *   create_queue       — provision a NATS JetStream queue (publish/subscribe)
  *   create_storage     — provision an S3-compatible object storage bucket prefix
  *   create_webhook     — provision an inbound webhook receiver URL
+ *   create_deploy      — upload a base64 gzip tarball (Dockerfile + source) and
+ *                        deploy a container; returns a public URL in ~30s
  *
  *   claim_resource     — turn an anonymous upgrade JWT into the dashboard claim URL
  *                        the agent should direct the user to (no API call — pure helper)
@@ -19,6 +21,11 @@
  *   list_resources     — list resources on the caller's account (requires INSTANODE_TOKEN)
  *   delete_resource    — permanently delete a resource (paid tier only)
  *   get_api_token      — mint a fresh bearer token for CLI / agent usage
+ *
+ *   list_deployments   — list all deployments for the caller's team
+ *   get_deployment     — fetch a deployment by app id (for polling build status)
+ *   redeploy           — trigger a rebuild + rolling update of an existing app
+ *   delete_deployment  — tear down a running deployment
  *
  * Every create_* tool surfaces the API's `note` and `upgrade` fields so the
  * agent can show the user the exact CTA + claim URL needed to keep the
@@ -45,7 +52,6 @@ import {
   AuthRequiredError,
   InstantClient,
   type ProvisionLimits,
-  type ProvisionResultBase,
   type Resource,
 } from "./client.js";
 
@@ -107,9 +113,13 @@ function formatLimits(limits: ProvisionLimits | undefined): string[] {
 /**
  * Render the `note` + `upgrade` fields the API returned. Every anonymous
  * provision response carries these; the agent should surface them verbatim
- * so the end user sees the exact CTA + claim URL.
+ * so the end user sees the exact CTA + claim URL. Structurally typed so
+ * it accepts both ProvisionResultBase and DeployResult.
  */
-function appendUpgradeBlock(lines: string[], result: ProvisionResultBase): void {
+function appendUpgradeBlock(
+  lines: string[],
+  result: { note?: string; upgrade?: string }
+): void {
   if (result.note) lines.push(`Note: ${result.note}`);
   if (result.upgrade) {
     lines.push(``, `Claim URL (direct the user here to keep this resource past 24h):`);
@@ -593,6 +603,261 @@ rotating an expiring token.`,
         `Or export it in your shell:`,
         `  export INSTANODE_TOKEN=<token above>`,
       ];
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
+    }
+  }
+);
+
+// ── Tool: create_deploy ───────────────────────────────────────────────────────
+
+server.tool(
+  "create_deploy",
+  `Deploy a containerized application on instanode.dev (POST /deploy/new).
+
+The agent base64-encodes a gzip tarball of the user's project (must contain a
+Dockerfile at the root), passes it as 'tarball_base64', and the API builds +
+deploys + returns a public URL in ~30s. Build is asynchronous: the initial
+response carries status="building"; poll 'get_deployment' with the returned
+'deploy_id' until status becomes "running" or "failed".
+
+Tarball construction (agent side, runtime depends on language):
+  tar = subprocess.check_output(["tar", "czf", "-", "-C", project_dir, "."])
+  tarball_base64 = base64.b64encode(tar).decode()
+Cap: 50 MB after base64 decode. Include only what 'docker build' needs;
+respect .dockerignore.
+
+Resource bindings: pass 'resource_bindings' as a map of env var name →
+resource token (UUID), e.g.
+  { "DATABASE_URL": "<token from create_postgres>", "REDIS_URL": "<token from create_cache>" }
+The API resolves each token to its connection URL server-side and injects
+the resolved URL into the container at deploy time. The MCP server does NOT
+pre-resolve tokens — that would round-trip every binding through
+GET /credentials and embed raw secrets in the tool params, which the agent
+host may log.
+
+Env vars: 'env_vars' takes plaintext values or vault://env/KEY refs (the
+vault is per-team, per-env; rotate without redeploying). 'env_vars' and
+'resource_bindings' are merged before being sent to the API; on collision,
+'resource_bindings' wins.
+
+Requires INSTANODE_TOKEN (anonymous tier cannot deploy).`,
+  {
+    tarball_base64: z
+      .string()
+      .min(1)
+      .describe(
+        "Base64-encoded gzip tarball of the project directory (must include a Dockerfile at the root). <50 MB after decode."
+      ),
+    name: z
+      .string()
+      .min(1)
+      .max(64)
+      .optional()
+      .describe("Optional friendly label (1–64 chars). Defaults to a server-generated slug."),
+    port: z
+      .number()
+      .int()
+      .min(1)
+      .max(65535)
+      .optional()
+      .describe("Container HTTP port. Default 8080."),
+    env: z
+      .string()
+      .optional()
+      .describe(
+        "Deploy environment scope: 'production' (default), 'staging', or 'development'. Each scope has its own vault and env_vars."
+      ),
+    env_vars: z
+      .record(z.string(), z.string())
+      .optional()
+      .describe(
+        "Env vars to inject into the container. Values may be plaintext or 'vault://env/KEY' refs (the API decrypts them at deploy time)."
+      ),
+    resource_bindings: z
+      .record(z.string(), z.string())
+      .optional()
+      .describe(
+        "Map of env var name → resource token UUID (e.g. { DATABASE_URL: '<postgres token>' }). The API resolves each token to its connection URL server-side. DO NOT pass raw connection URLs here — use create_postgres/create_cache/etc. to get tokens, then bind them."
+      ),
+  },
+  async (params) => {
+    try {
+      const result = await client.createDeploy(params);
+      const lines = [
+        `Deployment accepted (build is asynchronous).`,
+        `Deploy ID:      ${result.deploy_id}`,
+        `Status:         ${result.status}`,
+        result.url
+          ? `URL:            ${result.url}`
+          : `URL:            (pending — poll get_deployment until status="running")`,
+        `Build logs:     ${result.build_logs_url}`,
+      ];
+      appendUpgradeBlock(lines, result);
+      lines.push(
+        ``,
+        `Poll for terminal status:`,
+        `  get_deployment({ id: "${result.deploy_id}" })`,
+        ``,
+        `When status="running", the live URL is ready. Typical build time ~30s.`
+      );
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
+    }
+  }
+);
+
+// ── Tool: list_deployments ────────────────────────────────────────────────────
+
+server.tool(
+  "list_deployments",
+  `List deployments on the caller's team (GET /api/v1/deployments).
+
+Returns each deployment's app_id, tier, status (building/running/failed/...),
+live URL, port, and the deploy env scope (production/staging/...).
+
+Requires INSTANODE_TOKEN.`,
+  {},
+  async () => {
+    try {
+      const result = await client.listDeployments();
+      if (!result.items || result.items.length === 0) {
+        return textResult(
+          "No deployments on this team yet.\n\nUse create_deploy to ship one — pass a base64 gzip tarball of your project (must include a Dockerfile)."
+        );
+      }
+      const rows = result.items.map((d) => {
+        const parts = [
+          `[${d.app_id}] status=${d.status}`,
+          `  url:    ${d.url || "(pending)"}`,
+          `  tier:   ${d.tier}`,
+          `  port:   ${d.port}`,
+        ];
+        if (d.environment) parts.push(`  env:    ${d.environment}`);
+        if (d.created_at) parts.push(`  created: ${d.created_at}`);
+        if (d.error) parts.push(`  error:  ${d.error}`);
+        return parts.join("\n");
+      });
+      return textResult(
+        [`${result.total} deployment(s) on this team:`, "", ...rows].join("\n")
+      );
+    } catch (err) {
+      return textResult(formatError(err));
+    }
+  }
+);
+
+// ── Tool: get_deployment ──────────────────────────────────────────────────────
+
+server.tool(
+  "get_deployment",
+  `Fetch one deployment by its app id (GET /api/v1/deployments/:id).
+
+Use this after create_deploy to poll until status="running" (typically ~30s
+after the initial 202). Returns the same shape as list_deployments for a
+single record.
+
+Requires INSTANODE_TOKEN.`,
+  {
+    id: z
+      .string()
+      .min(1)
+      .describe("Deployment app id (returned as 'deploy_id' by create_deploy)."),
+  },
+  async ({ id }) => {
+    try {
+      const result = await client.getDeployment(id);
+      const d = result.item;
+      const lines = [
+        `Deployment ${d.app_id}`,
+        `Status:      ${d.status}`,
+        `URL:         ${d.url || "(pending)"}`,
+        `Tier:        ${d.tier}`,
+        `Port:        ${d.port}`,
+      ];
+      if (d.environment) lines.push(`Environment: ${d.environment}`);
+      if (d.error) lines.push(`Error:       ${d.error}`);
+      if (d.created_at) lines.push(`Created:     ${d.created_at}`);
+      if (d.updated_at) lines.push(`Updated:     ${d.updated_at}`);
+      if (d.env && Object.keys(d.env).length > 0) {
+        const visible = Object.keys(d.env).filter((k) => !k.startsWith("_"));
+        if (visible.length > 0) {
+          lines.push(``, `Env vars (${visible.length}):`);
+          for (const k of visible) {
+            lines.push(`  ${k}=${d.env[k]}`);
+          }
+        }
+      }
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
+    }
+  }
+);
+
+// ── Tool: redeploy ────────────────────────────────────────────────────────────
+
+server.tool(
+  "redeploy",
+  `Trigger a rebuild + rolling update of an existing deployment
+(POST /deploy/:id/redeploy). Useful after updating env vars via the
+dashboard, rotating a vault secret, or when the underlying image needs
+a refresh. The tarball from the original deploy is reused.
+
+Status flips back to "building"; poll get_deployment until it returns
+to "running".
+
+Requires INSTANODE_TOKEN.`,
+  {
+    id: z
+      .string()
+      .min(1)
+      .describe("Deployment app id (returned as 'deploy_id' by create_deploy)."),
+  },
+  async ({ id }) => {
+    try {
+      const result = await client.redeploy(id);
+      const d = result.item;
+      const lines = [
+        `Redeploy accepted for ${d.app_id}.`,
+        `Status: ${d.status}`,
+      ];
+      if (d.url) lines.push(`URL:    ${d.url}`);
+      lines.push(``, `Poll get_deployment({ id: "${d.app_id}" }) until status="running".`);
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
+    }
+  }
+);
+
+// ── Tool: delete_deployment ───────────────────────────────────────────────────
+
+server.tool(
+  "delete_deployment",
+  `Tear down a running deployment (DELETE /deploy/:id). Stops the container,
+releases compute, removes the public URL, and marks the deployment row
+deleted. Irreversible.
+
+Requires INSTANODE_TOKEN.`,
+  {
+    id: z
+      .string()
+      .min(1)
+      .describe("Deployment app id (returned as 'deploy_id' by create_deploy)."),
+  },
+  async ({ id }) => {
+    try {
+      const result = await client.deleteDeployment(id);
+      const lines = [
+        `Deployment deleted.`,
+        `ID:     ${result.id ?? id}`,
+        `Token:  ${result.token ?? id}`,
+        `Status: ${result.status ?? "deleted"}`,
+      ];
+      if (result.message) lines.push(`Message: ${result.message}`);
       return textResult(lines.join("\n"));
     } catch (err) {
       return textResult(formatError(err));

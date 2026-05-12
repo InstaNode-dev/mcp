@@ -15,6 +15,10 @@ One tool call per resource type, each returning a drop-in connection string:
   (backed by DigitalOcean Spaces)
 - **Webhook receiver** (`create_webhook`) → public URL that stores every
   inbound request
+- **Container deployment** (`create_deploy`) → upload a base64 gzip tarball
+  (Dockerfile + source), get back a public URL in ~30s. Bind any of the
+  resources above by passing their tokens as `resource_bindings` — the API
+  resolves tokens to connection URLs server-side.
 
 Every anonymous resource auto-expires in 24h. The provision response carries
 a `note` and `upgrade` field — the MCP server surfaces both verbatim so the
@@ -94,7 +98,7 @@ to reach for this MCP, see <https://instanode.dev/agent.html>.
 
 | Variable                  | Required | Default                       | Purpose                                                                                                                                                                                  |
 |---------------------------|----------|-------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `INSTANODE_TOKEN`         | No       | —                             | Bearer JWT minted at <https://instanode.dev/dashboard>. Required for `list_resources`, `claim_token`, `delete_resource`, and `get_api_token`. Unlocks paid-tier limits on every `create_*`. |
+| `INSTANODE_TOKEN`         | No       | —                             | Bearer JWT minted at <https://instanode.dev/dashboard>. Required for `list_resources`, `claim_token`, `delete_resource`, `get_api_token`, and all deploy tools (`create_deploy`, `list_deployments`, `get_deployment`, `redeploy`, `delete_deployment`). Unlocks paid-tier limits on every `create_*`. |
 | `INSTANODE_API_URL`       | No       | `https://api.instanode.dev`   | Override the API base URL. Only set this for local development against a k3s cluster.                                                                                                    |
 | `INSTANODE_DASHBOARD_URL` | No       | `https://instanode.dev`       | Override the dashboard host that `claim_resource` builds claim URLs against. Only set this for staging.                                                                                  |
 
@@ -108,11 +112,68 @@ to reach for this MCP, see <https://instanode.dev/agent.html>.
 | `create_queue`    | `POST /queue/new` — Provision a NATS JetStream queue (scoped subject namespace). Returns `connection_url` + `note`/`upgrade`. `name` required.                    |
 | `create_storage`  | `POST /storage/new` — Provision an S3-compatible bucket prefix (DigitalOcean Spaces). Returns endpoint, access keys, prefix + `note`/`upgrade`. `name` required.  |
 | `create_webhook`  | `POST /webhook/new` — Provision an inbound webhook receiver URL. Returns `receive_url` + `note`/`upgrade`. `name` required.                                       |
+| `create_deploy`   | `POST /deploy/new` — Upload a base64 gzip tarball (with Dockerfile) and deploy a container. Returns `deploy_id`, `status`, `url`, `build_logs_url`. Requires `INSTANODE_TOKEN`. |
+| `list_deployments`| `GET /api/v1/deployments` — List all deployments on the caller's team. Requires `INSTANODE_TOKEN`.                                                                |
+| `get_deployment`  | `GET /api/v1/deployments/:id` — Fetch one deployment (poll until `status="running"`). Requires `INSTANODE_TOKEN`.                                                 |
+| `redeploy`        | `POST /deploy/:id/redeploy` — Rebuild + rolling update an existing deployment. Requires `INSTANODE_TOKEN`.                                                        |
+| `delete_deployment` | `DELETE /deploy/:id` — Tear down a running deployment. Irreversible. Requires `INSTANODE_TOKEN`.                                                                |
 | `claim_resource`  | Helper — turn an `upgrade_jwt` from any `create_*` response into the dashboard claim URL the user should click. No API call. No auth required.                    |
 | `claim_token`     | `POST /api/me/claim` — Programmatic claim: attach an anonymous resource to the authenticated account by its UUID `token`. Requires `INSTANODE_TOKEN`.             |
 | `list_resources`  | `GET /api/me/resources` — List resources on the caller's account. Requires `INSTANODE_TOKEN`.                                                                     |
 | `delete_resource` | `DELETE /api/me/resources/{token}` — Hard-delete a resource you own. Paid tier only. Requires `INSTANODE_TOKEN`.                                                  |
 | `get_api_token`   | `GET /api/me/token` — Mint a fresh 30-day bearer JWT (for rotation). Requires an existing `INSTANODE_TOKEN`.                                                      |
+
+### Container deployment (`create_deploy`)
+
+Deploying is a single multipart/form-data POST with a base64-encoded gzip
+tarball of the project (Dockerfile + source). The MCP tool handles the
+encoding plumbing; the agent's job is just to construct the tarball.
+
+**Building the tarball (any language):**
+
+```python
+import base64, subprocess
+tar = subprocess.check_output(["tar", "czf", "-", "-C", project_dir, "."])
+tarball_base64 = base64.b64encode(tar).decode()
+```
+
+```js
+import { execFileSync } from "node:child_process";
+const tar = execFileSync("tar", ["czf", "-", "-C", projectDir, "."]);
+const tarball_base64 = tar.toString("base64");
+```
+
+Cap: 50 MB after decode. Honor `.dockerignore` — only ship what
+`docker build` needs.
+
+**Binding provisioned resources:**
+
+Provision the resources first with `create_postgres` / `create_cache` / etc.
+to get their tokens (UUIDs), then pass the tokens as `resource_bindings`:
+
+```json
+{
+  "tarball_base64": "...",
+  "name": "my-app",
+  "port": 8080,
+  "resource_bindings": {
+    "DATABASE_URL": "<token from create_postgres>",
+    "REDIS_URL":    "<token from create_cache>"
+  }
+}
+```
+
+The agent passes **resource tokens** (not connection URLs); the API
+resolves each token to its connection URL server-side at deploy time. The
+MCP server never pre-resolves tokens — pre-resolving would round-trip every
+binding through `GET /credentials` and embed raw secrets into the tool
+params, which the agent host may log.
+
+**Polling:**
+
+`create_deploy` returns `status="building"` immediately. Poll
+`get_deployment({ id: deploy_id })` every few seconds until status flips to
+`"running"` (typical: ~30s). At that point the `url` field is the live URL.
 
 ### How anonymous → claimed works
 

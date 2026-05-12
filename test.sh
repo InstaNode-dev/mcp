@@ -36,6 +36,8 @@ tools = {t['name'] for t in d['result']['tools']}
 expected = {
     'create_postgres', 'create_cache', 'create_nosql', 'create_queue',
     'create_storage', 'create_webhook',
+    'create_deploy', 'list_deployments', 'get_deployment',
+    'redeploy', 'delete_deployment',
     'claim_resource', 'claim_token',
     'list_resources', 'delete_resource', 'get_api_token',
 }
@@ -50,7 +52,19 @@ assert not still_there, f'dead tools still registered: {still_there}'
 extra = tools - expected
 assert not extra, f'unexpected tools registered: {extra}'
 " || fail "tools/list missing expected tools or carrying dead ones"
-pass "tools/list returns all 11 tools, no dead ones"
+pass "tools/list returns all 16 tools, no dead ones"
+
+# Test 2b: tools/list — deploy management tools are registered and discoverable.
+# Explicit assertion so the smoke test catches a regression on any single one.
+RESP=$(printf "%s\n%s\n" "$INIT" "$TOOLS_LIST" | INSTANODE_API_URL="$BASE_URL" $MCP 2>/dev/null | tail -1)
+echo "$RESP" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+tools = {t['name'] for t in d['result']['tools']}
+for needed in ('create_deploy', 'list_deployments', 'get_deployment', 'redeploy', 'delete_deployment'):
+    assert needed in tools, f'deploy tool not registered: {needed}'
+" || fail "tools/list missing deploy tool(s)"
+pass "tools/list includes create_deploy, list_deployments, get_deployment, redeploy, delete_deployment"
 
 # Test 3: list_resources — no token, should surface auth-required message
 LIST='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_resources","arguments":{}}}'
@@ -87,6 +101,18 @@ assert '/start?t=ey.fake.jwt' in text, f'expected claim URL with JWT, got: {text
 assert 'instanode' in text, f'expected dashboard host in URL, got: {text}'
 " || fail "claim_resource did not build the expected claim URL"
 pass "claim_resource builds dashboard claim URL from raw JWT"
+
+# Test 5b: create_deploy without INSTANODE_TOKEN should surface the auth-required message.
+# Uses a tiny fake base64 payload so we never hit the network for a real upload.
+DEPLOY_NOAUTH='{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"create_deploy","arguments":{"tarball_base64":"H4sIAAAAAAAA","name":"smoke"}}}'
+RESP=$(printf "%s\n%s\n" "$INIT" "$DEPLOY_NOAUTH" | INSTANODE_API_URL="$BASE_URL" $MCP 2>/dev/null | tail -1)
+echo "$RESP" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+text = d['result']['content'][0]['text']
+assert 'INSTANODE_TOKEN' in text, f'expected auth-required text, got: {text}'
+" || fail "create_deploy without token failed to surface auth message"
+pass "create_deploy without token returns auth-required message"
 
 # Test 6: claim_resource accepts a full /start?t= URL and re-extracts the JWT.
 CLAIM_URL='{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"claim_resource","arguments":{"upgrade_jwt":"https://instanode.dev/start?t=ey.url.jwt"}}}'

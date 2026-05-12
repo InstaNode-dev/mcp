@@ -16,6 +16,9 @@
  *   POST /queue/new    — NATS JetStream
  *   POST /storage/new  — S3-compatible bucket
  *   POST /webhook/new  — Webhook receiver
+ *   POST /deploy/new   — Container deployment (multipart/form-data)
+ *   GET  /api/v1/deployments, GET /api/v1/deployments/:id
+ *   POST /deploy/:id/redeploy, DELETE /deploy/:id
  *   GET  /api/me/resources, POST /api/me/claim, DELETE /api/me/resources/{token}
  *   GET  /api/me/token
  */
@@ -102,6 +105,103 @@ export interface WebhookProvisionResult extends ProvisionResultBase {
   receive_url: string;
 }
 
+/**
+ * Single deployment record as returned by the api's deploymentToMap helper.
+ * Fields that may be absent on a freshly-accepted (status="building") deploy
+ * are typed optional.
+ */
+export interface Deployment {
+  id: string;
+  /** Public-facing app id (also exposed as `token` alias). */
+  app_id: string;
+  token: string;
+  port: number;
+  tier: string;
+  status: string;
+  /** Live URL once the build finishes; empty string while building. */
+  url?: string;
+  /** Map of env var name → value (or vault://env/KEY ref). */
+  env?: Record<string, string>;
+  /** Deploy environment scope: production / staging / development / ... */
+  environment?: string;
+  provider_id?: string;
+  resource_id?: string;
+  error?: string;
+  created_at?: string;
+  updated_at?: string;
+  team_id?: string;
+}
+
+/**
+ * Response shape from POST /deploy/new (HTTP 202 Accepted).
+ *
+ * The api returns `{ ok, item: <deployment>, note }`. We flatten the item
+ * onto the result so callers can read `deploy_id`, `status`, `url`, etc.
+ * directly while still exposing the raw item for completeness.
+ */
+export interface DeployResult {
+  ok: boolean;
+  /** Public-facing app id — use this for GET /deploy/:id, redeploy, delete. */
+  deploy_id: string;
+  /** "building" on the initial 202; poll get_deployment for terminal status. */
+  status: string;
+  /** Live URL — empty string until the build finishes. */
+  url: string;
+  /** Where to fetch build logs (constructed client-side from base + id). */
+  build_logs_url: string;
+  /** Surfaced verbatim to the user. */
+  note?: string;
+  /** Anonymous-tier claim URL — same semantics as create_*. */
+  upgrade?: string;
+  upgrade_jwt?: string;
+  /** Raw deployment record from the api. */
+  item: Deployment;
+}
+
+export interface DeployListResult {
+  ok: boolean;
+  items: Deployment[];
+  total: number;
+}
+
+export interface DeployGetResult {
+  ok: boolean;
+  item: Deployment;
+}
+
+export interface DeployDeleteResult {
+  ok: boolean;
+  id?: string;
+  token?: string;
+  status?: string;
+  message?: string;
+}
+
+/** Caller-supplied params for create_deploy. */
+export interface CreateDeployParams {
+  /** Base64-encoded gzip tarball (with Dockerfile + source). <50 MB after decode. */
+  tarball_base64: string;
+  /** Optional friendly name. */
+  name?: string;
+  /** Container HTTP port. Default 8080. */
+  port?: number;
+  /** Deploy env scope: production / staging / development. Default "production". */
+  env?: string;
+  /**
+   * env vars dict; values can be plaintext or vault://env/KEY refs. The api
+   * decrypts vault refs at deploy time.
+   */
+  env_vars?: Record<string, string>;
+  /**
+   * Resource token bindings, e.g. `{ "DATABASE_URL": "<postgres token>" }`.
+   * The MCP client does NOT pre-resolve tokens to connection URLs — it
+   * merges this map into env_vars as-is and lets the api resolve token
+   * strings server-side. Pre-resolving would leak credentials into the
+   * tool params, which the agent host may log.
+   */
+  resource_bindings?: Record<string, string>;
+}
+
 export interface ClaimResult {
   ok: boolean;
   id: string;
@@ -186,7 +286,22 @@ export class InstantClient {
   private headers(): Record<string, string> {
     const h: Record<string, string> = {
       "Content-Type": "application/json",
-      "User-Agent": "instanode-mcp/0.8.0",
+      "User-Agent": "instanode-mcp/0.9.0",
+    };
+    const tok = this.bearerToken();
+    if (tok) {
+      h["Authorization"] = `Bearer ${tok}`;
+    }
+    return h;
+  }
+
+  /**
+   * Bare auth headers for multipart/form-data requests — we intentionally
+   * omit Content-Type here so fetch() can set its own multipart boundary.
+   */
+  private authHeaders(): Record<string, string> {
+    const h: Record<string, string> = {
+      "User-Agent": "instanode-mcp/0.9.0",
     };
     const tok = this.bearerToken();
     if (tok) {
@@ -229,6 +344,63 @@ export class InstantClient {
         data = JSON.parse(text);
       } catch {
         // Non-JSON body. Never return raw HTML to the caller.
+        if (!resp.ok) {
+          throw new ApiError(resp.status, `upstream error (HTTP ${resp.status})`);
+        }
+        throw new ApiError(resp.status, "upstream returned non-JSON response");
+      }
+    }
+
+    if (!resp.ok) {
+      const err = (data ?? {}) as {
+        error?: string;
+        message?: string;
+        upgrade_url?: string;
+      };
+      const message = err.message ?? "upstream error";
+      throw new ApiError(resp.status, message, err.error, err.upgrade_url);
+    }
+
+    return data as T;
+  }
+
+  /**
+   * Send a multipart/form-data POST. Used for endpoints that upload binary
+   * blobs (today: POST /deploy/new). The api accepts a `tarball` file part
+   * plus arbitrary string fields (name, port, env, env_vars JSON).
+   *
+   * Mirrors `request<T>` for error handling — non-2xx bodies are coerced into
+   * an ApiError carrying the api's `error` code and `upgrade_url` (if present).
+   */
+  async requestMultipart<T>(
+    path: string,
+    form: FormData,
+    opts: { requireAuth?: boolean } = {}
+  ): Promise<T> {
+    if (opts.requireAuth && !this.bearerToken()) {
+      throw new AuthRequiredError();
+    }
+
+    const url = `${this.baseURL}${path}`;
+    let resp: Response;
+    try {
+      resp = await fetch(url, {
+        method: "POST",
+        // Do NOT set Content-Type — fetch fills in the boundary itself.
+        headers: this.authHeaders(),
+        body: form,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new ApiError(0, `network error reaching instanode.dev: ${msg}`);
+    }
+
+    const text = await resp.text();
+    let data: unknown = undefined;
+    if (text.length > 0) {
+      try {
+        data = JSON.parse(text);
+      } catch {
         if (!resp.ok) {
           throw new ApiError(resp.status, `upstream error (HTTP ${resp.status})`);
         }
@@ -311,5 +483,102 @@ export class InstantClient {
     return this.request<ApiTokenResult>("GET", "/api/me/token", undefined, {
       requireAuth: true,
     });
+  }
+
+  /**
+   * POST /deploy/new — upload a tarball + Dockerfile and deploy. Multipart.
+   *
+   * `tarball_base64` is a base64-encoded gzip tar; we decode it to a Buffer
+   * and attach it as the `tarball` form file. `resource_bindings` is merged
+   * into `env_vars` as-is — the agent passes raw resource tokens (UUIDs) and
+   * the api resolves them server-side at deploy time. We do not pre-resolve
+   * here: that would round-trip every binding to GET /credentials and embed
+   * the raw connection URLs in tool params, which the agent host may log.
+   *
+   * Returns the api's 202 response flattened so callers can read `deploy_id`,
+   * `status`, `url`, and `build_logs_url` directly.
+   */
+  async createDeploy(params: CreateDeployParams): Promise<DeployResult> {
+    const form = new FormData();
+
+    // Decode the base64 tarball and attach as a binary file part.
+    const tarball = Buffer.from(params.tarball_base64, "base64");
+    const blob = new Blob([tarball], { type: "application/gzip" });
+    form.append("tarball", blob, "app.tar.gz");
+
+    if (params.name) form.append("name", params.name);
+    if (typeof params.port === "number") form.append("port", String(params.port));
+    if (params.env) form.append("env", params.env);
+
+    // Merge resource_bindings into env_vars. The api treats every value
+    // either as plaintext, a vault://env/KEY ref, or — for deploy bindings —
+    // a raw resource token that the server resolves to a connection URL
+    // before injecting it into the running container.
+    const merged: Record<string, string> = { ...(params.env_vars ?? {}) };
+    if (params.resource_bindings) {
+      for (const [k, v] of Object.entries(params.resource_bindings)) {
+        merged[k] = v;
+      }
+    }
+    if (Object.keys(merged).length > 0) {
+      form.append("env_vars", JSON.stringify(merged));
+    }
+
+    const raw = await this.requestMultipart<{
+      ok: boolean;
+      item: Deployment;
+      note?: string;
+      upgrade?: string;
+      upgrade_jwt?: string;
+    }>("/deploy/new", form, { requireAuth: true });
+
+    return {
+      ok: raw.ok,
+      deploy_id: raw.item.app_id,
+      status: raw.item.status,
+      url: raw.item.url ?? "",
+      build_logs_url: `${this.baseURL}/deploy/${encodeURIComponent(raw.item.app_id)}/logs`,
+      note: raw.note,
+      upgrade: raw.upgrade,
+      upgrade_jwt: raw.upgrade_jwt,
+      item: raw.item,
+    };
+  }
+
+  /** GET /api/v1/deployments — list deployments for the authenticated team. */
+  async listDeployments(): Promise<DeployListResult> {
+    return this.request<DeployListResult>("GET", "/api/v1/deployments", undefined, {
+      requireAuth: true,
+    });
+  }
+
+  /** GET /api/v1/deployments/:id — fetch one deployment by app id. */
+  async getDeployment(id: string): Promise<DeployGetResult> {
+    return this.request<DeployGetResult>(
+      "GET",
+      `/api/v1/deployments/${encodeURIComponent(id)}`,
+      undefined,
+      { requireAuth: true }
+    );
+  }
+
+  /** POST /deploy/:id/redeploy — rebuild + rolling update an existing app. */
+  async redeploy(id: string): Promise<DeployGetResult> {
+    return this.request<DeployGetResult>(
+      "POST",
+      `/deploy/${encodeURIComponent(id)}/redeploy`,
+      undefined,
+      { requireAuth: true }
+    );
+  }
+
+  /** DELETE /deploy/:id — tear down the running pod + remove the record. */
+  async deleteDeployment(id: string): Promise<DeployDeleteResult> {
+    return this.request<DeployDeleteResult>(
+      "DELETE",
+      `/deploy/${encodeURIComponent(id)}`,
+      undefined,
+      { requireAuth: true }
+    );
   }
 }
