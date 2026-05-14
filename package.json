@@ -1,6 +1,6 @@
 {
   "name": "instanode-mcp",
-  "version": "0.9.1",
+  "version": "0.10.1",
   "description": "MCP server for instanode.dev \u2014 lets AI coding agents provision ephemeral Postgres, Redis, MongoDB, NATS queues, S3-compatible object storage, webhook receivers, and deploy containerized apps over HTTPS, with optional bearer-token auth for paid users.",
   "keywords": [
     "mcp",
