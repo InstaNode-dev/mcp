@@ -19,8 +19,16 @@
  *   POST /deploy/new   — Container deployment (multipart/form-data)
  *   GET  /api/v1/deployments, GET /api/v1/deployments/:id
  *   POST /deploy/:id/redeploy, DELETE /deploy/:id
- *   GET  /api/me/resources, POST /api/me/claim, DELETE /api/me/resources/{token}
- *   GET  /api/me/token
+ *   GET  /api/v1/resources             — list resources for the authenticated team
+ *   DELETE /api/v1/resources/{token}   — soft-delete (Pro+; free-tier rows auto-expire)
+ *   POST /claim                        — convert anonymous JWT → authenticated team
+ *   POST /api/v1/auth/api-keys         — mint a fresh bearer JWT
+ *
+ * Historical note: an earlier MCP build called /api/me/resources, /api/me/claim,
+ * /api/me/token — these were never live (a typo'd /api/me prefix that the
+ * router never registered). Every such call returned 404 and the agent saw
+ * "instanode.dev error (404)" with no path forward. FIX-E #C5 rewired the
+ * client to the canonical routes above.
  */
 
 const DEFAULT_BASE_URL = "https://api.instanode.dev";
@@ -272,13 +280,40 @@ export class ApiError extends Error {
   readonly status: number;
   readonly code?: string;
   readonly upgradeURL?: string;
+  /**
+   * The `agent_action` field from the API's error envelope, when present.
+   *
+   * The API copies a verbatim sentence the agent should surface to the human
+   * user (e.g. "Tell the user they've hit the hobby tier storage limit — have
+   * them upgrade at https://instanode.dev/pricing"). FIX-E #C7 plumbs this
+   * through to the formatError handler so the MCP user actually sees it.
+   * Previously the MCP discarded `agent_action` entirely and the LLM had to
+   * guess at the action from a generic "API error 402" string.
+   */
+  readonly agentAction?: string;
+  /**
+   * The `claim_url` field from the API's error envelope on
+   * `free_tier_recycle_requires_claim` (the anonymous-fingerprint recycle gate).
+   * Distinct from `upgradeURL` — `claimURL` is the identity step (anon → claimed),
+   * `upgradeURL` is the tier step (claimed → paid).
+   */
+  readonly claimURL?: string;
 
-  constructor(status: number, message: string, code?: string, upgradeURL?: string) {
+  constructor(
+    status: number,
+    message: string,
+    code?: string,
+    upgradeURL?: string,
+    agentAction?: string,
+    claimURL?: string
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
     this.upgradeURL = upgradeURL;
+    this.agentAction = agentAction;
+    this.claimURL = claimURL;
   }
 }
 
@@ -305,6 +340,17 @@ export class InstantClient {
     );
   }
 
+  /**
+   * API base URL (where /db/new, /claim, /start etc. live). Distinct from
+   * `dashboardURL` — the dashboard host is for the human signin flow, the API
+   * host is what /start redirects FROM. The `claim_resource` MCP tool builds
+   * `{apiBaseURL}/start?t=<jwt>` because /start is a route on the API, not the
+   * dashboard.
+   */
+  apiBaseURL(): string {
+    return this.baseURL;
+  }
+
   /** Read the bearer token fresh from the environment on every call. */
   private bearerToken(): string | undefined {
     const tok = process.env["INSTANODE_TOKEN"];
@@ -314,7 +360,7 @@ export class InstantClient {
   private headers(): Record<string, string> {
     const h: Record<string, string> = {
       "Content-Type": "application/json",
-      "User-Agent": "instanode-mcp/0.10.0",
+      "User-Agent": "instanode-mcp/0.10.1",
     };
     const tok = this.bearerToken();
     if (tok) {
@@ -329,7 +375,7 @@ export class InstantClient {
    */
   private authHeaders(): Record<string, string> {
     const h: Record<string, string> = {
-      "User-Agent": "instanode-mcp/0.10.0",
+      "User-Agent": "instanode-mcp/0.10.1",
     };
     const tok = this.bearerToken();
     if (tok) {
@@ -384,9 +430,18 @@ export class InstantClient {
         error?: string;
         message?: string;
         upgrade_url?: string;
+        agent_action?: string;
+        claim_url?: string;
       };
       const message = err.message ?? "upstream error";
-      throw new ApiError(resp.status, message, err.error, err.upgrade_url);
+      throw new ApiError(
+        resp.status,
+        message,
+        err.error,
+        err.upgrade_url,
+        err.agent_action,
+        err.claim_url
+      );
     }
 
     return data as T;
@@ -441,9 +496,18 @@ export class InstantClient {
         error?: string;
         message?: string;
         upgrade_url?: string;
+        agent_action?: string;
+        claim_url?: string;
       };
       const message = err.message ?? "upstream error";
-      throw new ApiError(resp.status, message, err.error, err.upgrade_url);
+      throw new ApiError(
+        resp.status,
+        message,
+        err.error,
+        err.upgrade_url,
+        err.agent_action,
+        err.claim_url
+      );
     }
 
     return data as T;
@@ -479,38 +543,87 @@ export class InstantClient {
     return this.request<WebhookProvisionResult>("POST", "/webhook/new", { name });
   }
 
-  /** GET /api/me/resources — list resources claimed by the authenticated caller. Requires bearer. */
+  /**
+   * GET /api/v1/resources — list resources for the authenticated team.
+   *
+   * The canonical route is `/api/v1/resources` (the previous `/api/me/resources`
+   * path was never registered — every call 404'd). The live API returns
+   * `{ ok, items, total }`; this helper unwraps to the raw items array so the
+   * tool can iterate naturally.
+   */
   async listResources(): Promise<Resource[]> {
-    return this.request<Resource[]>("GET", "/api/me/resources", undefined, {
-      requireAuth: true,
-    });
+    const wrapped = await this.request<{ ok: boolean; items: Resource[]; total: number }>(
+      "GET",
+      "/api/v1/resources",
+      undefined,
+      { requireAuth: true }
+    );
+    return wrapped.items ?? [];
   }
 
-  /** POST /api/me/claim — attach an anonymous token to the authenticated account. */
-  async claimToken(token: string): Promise<ClaimResult> {
+  /**
+   * POST /claim — convert an anonymous onboarding JWT into a claimed team.
+   *
+   * Note: `/claim` requires {jwt, email} — it's the same flow the dashboard
+   * uses. There is no programmatic "claim a token to an existing team" route;
+   * the canonical claim primitive is identity-bound. Pass the upgrade_jwt
+   * returned by any anonymous provisioning response.
+   */
+  async claimToken(jwt: string, email: string): Promise<ClaimResult> {
     return this.request<ClaimResult>(
       "POST",
-      "/api/me/claim",
-      { token },
-      { requireAuth: true }
+      "/claim",
+      { jwt, email },
+      { requireAuth: false }
     );
   }
 
-  /** DELETE /api/me/resources/{token} — paid-only hard-delete. */
+  /**
+   * DELETE /api/v1/resources/{token} — soft-delete a resource (paid tier only).
+   *
+   * The path parameter is the resource's UUID token (the same value emitted
+   * as `token` by every create_* response). Free-tier and anonymous resources
+   * auto-expire and cannot be deleted manually — the API surfaces the upgrade
+   * URL in the 403 envelope.
+   */
   async deleteResource(token: string): Promise<DeleteResult> {
     return this.request<DeleteResult>(
       "DELETE",
-      `/api/me/resources/${encodeURIComponent(token)}`,
+      `/api/v1/resources/${encodeURIComponent(token)}`,
       undefined,
       { requireAuth: true }
     );
   }
 
-  /** GET /api/me/token — mint a fresh bearer JWT. Requires an existing bearer or session cookie. */
-  async getApiToken(): Promise<ApiTokenResult> {
-    return this.request<ApiTokenResult>("GET", "/api/me/token", undefined, {
-      requireAuth: true,
-    });
+  /**
+   * POST /api/v1/auth/api-keys — mint a fresh bearer key for the authenticated team.
+   *
+   * Requires an existing bearer (you have to be signed in to mint another key).
+   * The API returns the plaintext key exactly once in the `key` field — it is
+   * never recoverable after this response. Default name "instanode-mcp" so the
+   * dashboard's key list shows where the key came from.
+   */
+  async getApiToken(name?: string): Promise<ApiTokenResult> {
+    const raw = await this.request<{
+      ok: boolean;
+      id: string;
+      name: string;
+      key: string;
+      note?: string;
+      created_at: string;
+    }>(
+      "POST",
+      "/api/v1/auth/api-keys",
+      { name: name && name.length > 0 ? name : "instanode-mcp", scopes: ["read", "write"] },
+      { requireAuth: true }
+    );
+    return {
+      ok: raw.ok,
+      token: raw.key,
+      // Mint returns no explicit expiry — keys are revocation-based, not
+      // time-bound. Surface a sentinel (0) so the tool description can adapt.
+      expires_in: 0,
+    };
   }
 
   /**

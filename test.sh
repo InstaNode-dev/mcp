@@ -166,5 +166,35 @@ assert '/start?t=ey.url.jwt' in text, f'expected JWT extracted from URL, got: {t
 " || fail "claim_resource did not extract JWT from a full URL"
 pass "claim_resource extracts JWT from a full /start?t= URL"
 
+# Test 7: FIX-E #C6 — claim_resource MUST point at the API host (api.instanode.dev),
+# NOT the dashboard host. /start is a route on the API. Earlier versions built
+# https://instanode.dev/start?t=..., which 404'd (dashboard has no /start route;
+# the dashboard's path is /claim).
+CLAIM_API_HOST='{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"claim_resource","arguments":{"upgrade_jwt":"ey.host.jwt"}}}'
+RESP=$(printf "%s\n%s\n" "$INIT" "$CLAIM_API_HOST" | INSTANODE_API_URL="$BASE_URL" $MCP 2>/dev/null | tail -1)
+echo "$RESP" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+text = d['result']['content'][0]['text']
+# When BASE_URL is the default api.instanode.dev or a local override, the
+# claim URL must originate on the API host, never the dashboard host.
+assert 'api.instanode.dev/start' in text or 'localhost' in text or '127.0.0.1' in text or '://api.' in text, f'claim_resource should use API host, got: {text}'
+" || fail "claim_resource still points at the wrong host (#C6)"
+pass "claim_resource uses API host (api.instanode.dev) for /start"
+
+# Test 8: FIX-E #C5 — claim_token now takes both upgrade_jwt AND email.
+# Schema regression check: calling with the OLD shape (just token) should fail.
+OLD_CLAIM='{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"claim_token","arguments":{"token":"00000000-0000-0000-0000-000000000000"}}}'
+RESP=$(printf "%s\n%s\n" "$INIT" "$OLD_CLAIM" | INSTANODE_API_URL="$BASE_URL" $MCP 2>/dev/null | tail -1)
+echo "$RESP" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+# The old shape should be rejected (zod) or surface a missing-field error.
+err = d.get('error') or (d.get('result') or {}).get('isError')
+text = (d.get('result') or {}).get('content', [{}])[0].get('text', '') if d.get('result') else ''
+assert err or 'email' in text.lower() or 'upgrade_jwt' in text.lower(), f'old claim_token shape should be rejected, got: {d}'
+" || fail "claim_token still accepts the old single-token shape (#C5)"
+pass "claim_token enforces new (upgrade_jwt, email) shape"
+
 echo ""
 echo "All tests passed."

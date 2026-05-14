@@ -65,32 +65,60 @@ const server = new McpServer({
   version: pkgVersion,
 });
 
-/** Format an error thrown by the client into a short text block for the agent. */
+/**
+ * Format an error thrown by the client into a short text block for the agent.
+ *
+ * FIX-E #C7: when the API returns an error envelope carrying `agent_action`,
+ * surface it verbatim — it's a sentence the platform copy-edited specifically
+ * for the LLM to read aloud to the user. Previously the MCP discarded
+ * `agent_action` entirely and the LLM had to guess at the right action from a
+ * generic "API error 402" string, which often produced wrong-by-default
+ * suggestions (e.g. "try again" on a tier-gate that won't resolve without an
+ * upgrade). Format:
+ *
+ *   {short status summary}
+ *
+ *   Action: {agent_action verbatim}
+ *
+ *   Upgrade: {upgrade_url, when present}
+ *   Claim:   {claim_url, when present}
+ */
 function formatError(err: unknown): string {
   if (err instanceof AuthRequiredError) {
     return err.message;
   }
   if (err instanceof ApiError) {
+    // Build the headline. We keep this short — `agent_action` does the real
+    // work below.
+    let headline: string;
     if (err.status === 401) {
-      return (
+      headline =
         "Request rejected (401 unauthorized). " +
-        "Mint a token at https://instanode.dev/dashboard and set INSTANODE_TOKEN in your MCP server env."
-      );
-    }
-    if (err.status === 403 && err.code === "paid_tier_only") {
-      const upgrade = err.upgradeURL ?? "https://instanode.dev/pricing.html";
-      return `Free-tier resource cannot be deleted — it will auto-expire in 24h.\nUpgrade for hard-delete: ${upgrade}`;
-    }
-    if (err.status === 429) {
-      return (
+        "Mint a token at https://instanode.dev/dashboard and set INSTANODE_TOKEN in your MCP server env.";
+    } else if (err.status === 403 && err.code === "paid_tier_only") {
+      headline =
+        "Free-tier resource cannot be deleted — it will auto-expire in 24h.";
+    } else if (err.status === 429) {
+      headline =
         "Rate limited (5 anonymous provisions/day per /24 subnet). " +
-        "Set INSTANODE_TOKEN to a paid bearer to remove the cap."
-      );
+        "Set INSTANODE_TOKEN to a paid bearer to remove the cap.";
+    } else if (err.code) {
+      headline = `instanode.dev error (${err.status} ${err.code}): ${err.message}`;
+    } else {
+      headline = `instanode.dev error (${err.status}): ${err.message}`;
     }
-    if (err.code) {
-      return `instanode.dev error (${err.status} ${err.code}): ${err.message}`;
+
+    const lines: string[] = [headline];
+    if (err.agentAction && err.agentAction.length > 0) {
+      lines.push("", `Action: ${err.agentAction}`);
     }
-    return `instanode.dev error (${err.status}): ${err.message}`;
+    if (err.upgradeURL && err.upgradeURL.length > 0) {
+      lines.push(`Upgrade: ${err.upgradeURL}`);
+    }
+    if (err.claimURL && err.claimURL.length > 0) {
+      lines.push(`Claim:   ${err.claimURL}`);
+    }
+    return lines.join("\n");
   }
   const msg = err instanceof Error ? err.message : String(err);
   return `instanode.dev error: ${msg}`;
@@ -400,10 +428,11 @@ With INSTANODE_TOKEN (paid): 1000+ stored per tier, permanent.`,
 
 server.tool(
   "claim_resource",
-  `Turn an anonymous resource's upgrade JWT into the dashboard claim URL the
-agent should direct the user to. NO API call — pure helper: builds
-https://instanode.dev/start?t=<jwt> from the JWT the create_* tools return in
-the 'upgrade_jwt' field.
+  `Turn an anonymous resource's upgrade JWT into the API claim URL the agent
+should direct the user to. NO API call — pure helper: builds
+https://api.instanode.dev/start?t=<jwt> from the JWT the create_* tools return
+in the 'upgrade_jwt' field. /start issues a 302 redirect to the dashboard's
+/claim page, which drives the email login.
 
 Use this when:
   1. You just provisioned an anonymous resource via create_postgres /
@@ -415,8 +444,8 @@ Use this when:
 The MCP server cannot complete the claim for the user — it requires a browser
 session for OAuth login. Show the URL and tell the user to click it.
 
-If you (the agent) already have INSTANODE_TOKEN set, use 'claim_token' instead
-to claim programmatically.`,
+If you (the agent) already have the user's email and the upgrade JWT, use
+'claim_token' instead to claim programmatically (POST /claim).`,
   {
     upgrade_jwt: z
       .string()
@@ -436,20 +465,24 @@ to claim programmatically.`,
     } catch {
       // Not a URL — assume it's a raw JWT, which is the common case.
     }
-    const dashboard = client.dashboardURL();
-    const claimURL = `${dashboard}/start?t=${encodeURIComponent(jwt)}`;
+    // /start lives on the API host (api.instanode.dev), NOT the dashboard
+    // host (instanode.dev). The API issues a 302 to the dashboard's /claim
+    // page — that's the indirection so the dashboard host can move without
+    // breaking JWTs already-issued and pasted into chats. FIX-E #C6.
+    const apiBase = client.apiBaseURL();
+    const claimURL = `${apiBase}/start?t=${encodeURIComponent(jwt)}`;
     const lines = [
       `Claim URL ready. Direct the user here to keep the resource past 24h:`,
       ``,
       `  ${claimURL}`,
       ``,
       `What happens when they click it:`,
-      `  1. GET /start?t=<jwt> on the API redirects them to the dashboard /claim page.`,
+      `  1. GET /start?t=<jwt> on the API issues a 302 to the dashboard's /claim page.`,
       `  2. They sign in with GitHub or Google (or magic link).`,
       `  3. The resource is attached to their account. Free tier keeps it visible;`,
       `     paid tier (hobby/pro/team) makes it permanent and lifts anonymous limits.`,
       ``,
-      `If you have INSTANODE_TOKEN set, call 'claim_token' instead to attach`,
+      `If you have the user's email handy, call 'claim_token' instead to attach`,
       `the resource programmatically without a browser round-trip.`,
     ];
     return textResult(lines.join("\n"));
@@ -460,36 +493,56 @@ to claim programmatically.`,
 
 server.tool(
   "claim_token",
-  `Attach an anonymous resource (returned by any create_* tool) to the
-authenticated caller's account programmatically (POST /api/me/claim).
-Idempotent — re-claiming a token you already own returns the same payload.
+  `Convert an anonymous upgrade JWT into a claimed team programmatically
+(POST /claim). Same flow the dashboard's /claim page drives — but lets an
+agent that already knows the user's email skip the browser round-trip.
 
-For paid callers, the resource's tier is upgraded to the team's plan tier
-('hobby'/'pro'/'team') and its expiry is cleared. For free authenticated
-callers, the resource stays anonymous-tier but is now visible on the
-dashboard.
+The 'upgrade_jwt' is the JWT returned in the upgrade_jwt field of any
+create_* tool response (NOT the per-resource UUID token). It can also be
+extracted from the 't=' query param of the upgrade URL.
 
-Requires INSTANODE_TOKEN. If you don't have one (typical agent flow), use
-'claim_resource' instead to get a URL the user can click in their browser.
+On success the API creates (or attaches to) the user's team, links every
+anonymous resource issued under that JWT, and returns a 24h session token.
+The session token isn't returned to the agent here — use 'get_api_token'
+or have the user mint one in the dashboard to authenticate future MCP calls.
 
-Pass the resource's 'token' field (UUID), not the upgrade JWT.`,
+If you don't have the user's email yet, use 'claim_resource' instead to get
+a URL the user can click in their browser.`,
   {
-    token: z
+    upgrade_jwt: z
       .string()
       .min(1)
       .describe(
-        "Resource token (UUID) returned in the 'token' field by any create_* tool."
+        "The 'upgrade_jwt' field returned by any create_* tool (or the raw JWT from the 'upgrade' URL). Required."
+      ),
+    email: z
+      .string()
+      .email()
+      .describe(
+        "User's email address. The team will be created or matched against this email."
       ),
   },
-  async ({ token }) => {
+  async ({ upgrade_jwt, email }) => {
     try {
-      const result = await client.claimToken(token);
+      // Accept either a raw JWT or a full https://...start?t=<jwt> URL.
+      let jwt = upgrade_jwt.trim();
+      try {
+        const u = new URL(jwt);
+        const t = u.searchParams.get("t");
+        if (t) jwt = t;
+      } catch {
+        // Not a URL — common case, leave jwt as-is.
+      }
+      const result = await client.claimToken(jwt, email);
       const lines = [
-        `Token claimed.`,
-        `Resource type: ${result.resource_type}`,
-        `Token:         ${result.token}`,
-        `Tier:          ${result.tier}`,
-        `Status:        ${result.status}`,
+        `JWT claimed.`,
+        `Resource type: ${result.resource_type ?? "(see list_resources)"}`,
+        `Token:         ${result.token ?? "(see list_resources)"}`,
+        `Tier:          ${result.tier ?? "(see list_resources)"}`,
+        `Status:        ${result.status ?? "(see list_resources)"}`,
+        ``,
+        `Mint a bearer token via 'get_api_token' (after signing in once at the dashboard)`,
+        `to use the authenticated MCP tools (list_resources, delete_resource, etc.).`,
       ];
       if (result.name) lines.push(`Name: ${result.name}`);
       return textResult(lines.join("\n"));
@@ -504,11 +557,11 @@ Pass the resource's 'token' field (UUID), not the upgrade JWT.`,
 server.tool(
   "list_resources",
   `List resources on the caller's instanode.dev account, newest first
-(GET /api/me/resources).
+(GET /api/v1/resources).
 
 Requires INSTANODE_TOKEN to be set. Mint one at https://instanode.dev/dashboard.
 
-Returns each resource's type (postgres/cache/nosql/queue/storage/webhook),
+Returns each resource's type (postgres/cache/nosql/queue/storage/webhook/vector),
 token, tier, status, name, and expiry.`,
   {},
   async () => {
@@ -544,7 +597,7 @@ token, tier, status, name, and expiry.`,
 server.tool(
   "delete_resource",
   `Permanently delete one of the caller's resources
-(DELETE /api/me/resources/{token}). Drops the underlying Postgres/Mongo
+(DELETE /api/v1/resources/{token}). Drops the underlying Postgres/Mongo
 database, Redis ACL user, NATS user, storage prefix, or clears the webhook's
 request log, then marks the row status='deleted'.
 
@@ -578,30 +631,43 @@ Requires INSTANODE_TOKEN.`,
 
 server.tool(
   "get_api_token",
-  `Mint a fresh 30-day bearer JWT for the authenticated caller and return it
-as plain text (GET /api/me/token). The user should paste the returned token
+  `Mint a fresh API key for the authenticated caller and return it as plain
+text (POST /api/v1/auth/api-keys). The user should paste the returned key
 into their MCP server config as INSTANODE_TOKEN (or export it as an env var
 for CLI use).
 
-Requires an existing INSTANODE_TOKEN (or a session cookie, though session
-cookies aren't available in this transport). This is primarily useful for
-rotating an expiring token.`,
-  {},
-  async () => {
+API keys are revocation-based (not time-bound) — they live until revoked
+in the dashboard. Requires an existing INSTANODE_TOKEN to bootstrap a new
+one; the typical flow is: claim once via the dashboard (browser), mint a
+key, paste it into the MCP env, then use this tool to rotate as needed.`,
+  {
+    name: z
+      .string()
+      .min(1)
+      .max(120)
+      .optional()
+      .describe(
+        "Optional human-readable label so you can identify this key in the dashboard. Defaults to 'instanode-mcp'."
+      ),
+  },
+  async ({ name }) => {
     try {
-      const result = await client.getApiToken();
+      const result = await client.getApiToken(name);
       const lines = [
-        `New bearer token minted.`,
-        `Expires in: ${result.expires_in} seconds (~${Math.round(result.expires_in / 86400)} days)`,
+        `New API key minted.`,
+        `(Keys are revocation-based — they live until you revoke them in the dashboard.)`,
         ``,
-        `Token:`,
+        `Key:`,
         result.token,
         ``,
         `Set it in your MCP server config:`,
-        `  "env": { "INSTANODE_TOKEN": "<token above>" }`,
+        `  "env": { "INSTANODE_TOKEN": "<key above>" }`,
         ``,
         `Or export it in your shell:`,
-        `  export INSTANODE_TOKEN=<token above>`,
+        `  export INSTANODE_TOKEN=<key above>`,
+        ``,
+        `The plaintext key is shown ONCE — save it now. To rotate later, mint a new`,
+        `key here and revoke the old one at https://instanode.dev/dashboard/settings.`,
       ];
       return textResult(lines.join("\n"));
     } catch (err) {

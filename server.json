@@ -6,27 +6,27 @@
     "url": "https://github.com/InstaNode-dev/mcp",
     "source": "github"
   },
-  "version": "0.9.0",
+  "version": "0.10.1",
   "websiteUrl": "https://instanode.dev",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "instanode-mcp",
-      "version": "0.9.0",
+      "version": "0.10.1",
       "transport": {
         "type": "stdio"
       },
       "environmentVariables": [
         {
           "name": "INSTANODE_TOKEN",
-          "description": "Optional bearer JWT for paid-tier callers. Mint at https://instanode.dev/dashboard \u2192 'API token for CLI / agent'. Lifts the free-tier 5-per-subnet-per-day provisioning cap and auto-links new resources to your account. Leave unset to use the free tier anonymously.",
+          "description": "Optional bearer JWT for paid-tier callers. Mint at https://instanode.dev/dashboard → 'API token for CLI / agent'. Lifts the free-tier 5-per-subnet-per-day provisioning cap and auto-links new resources to your account. Leave unset to use the free tier anonymously.",
           "isRequired": false,
           "isSecret": true,
           "format": "string"
         },
         {
-          "name": "INSTANODE_API_BASE",
-          "description": "Override the API base URL. Defaults to https://api.instanode.dev. Useful for self-hosted deployments.",
+          "name": "INSTANODE_API_URL",
+          "description": "Override the API base URL. Defaults to https://api.instanode.dev. Useful for self-hosted deployments. (Formerly INSTANODE_API_BASE — the client.ts always read INSTANODE_API_URL; the older registry name never took effect.)",
           "isRequired": false,
           "isSecret": false,
           "format": "string",
