@@ -177,6 +177,37 @@ params, which the agent host may log.
 `get_deployment({ id: deploy_id })` every few seconds until status flips to
 `"running"` (typical: ~30s). At that point the `url` field is the live URL.
 
+### Private deploys
+
+Set `private: true` and pass `allowed_ips` to restrict access to specific IPs
+or CIDR blocks at the Ingress. Useful when the agent is asked to deploy a
+CRM, internal dashboard, or staging app that should only be reachable by the
+user.
+
+**Pro tier or higher required.** Hobby callers will see HTTP 402 with an
+`agent_action` field — the MCP server surfaces the upgrade URL so the agent
+can prompt the user to upgrade.
+
+**Example prompt** (paste into Claude Code):
+
+> "Deploy my CRM as a private app, only accessible from 1.2.3.4 and my office
+> subnet 10.0.0.0/8"
+
+The agent will then call:
+
+```json
+{
+  "tarball_base64": "...",
+  "name": "my-crm",
+  "private": true,
+  "allowed_ips": ["1.2.3.4", "10.0.0.0/8"]
+}
+```
+
+`get_deployment` and `list_deployments` surface `private` + `allowed_ips`
+back to the agent so it can confirm the policy to the user. To turn a
+private deploy public, redeploy without the flags.
+
 ### How anonymous → claimed works
 
 Every `create_*` tool returns three fields the agent should treat as
