@@ -112,7 +112,7 @@ to reach for this MCP, see <https://instanode.dev/agent.html>.
 | `create_queue`    | `POST /queue/new` — Provision a NATS JetStream queue (scoped subject namespace). Returns `connection_url` + `note`/`upgrade`. `name` required.                    |
 | `create_storage`  | `POST /storage/new` — Provision an S3-compatible bucket prefix (DigitalOcean Spaces). Returns endpoint, access keys, prefix + `note`/`upgrade`. `name` required.  |
 | `create_webhook`  | `POST /webhook/new` — Provision an inbound webhook receiver URL. Returns `receive_url` + `note`/`upgrade`. `name` required.                                       |
-| `create_deploy`   | `POST /deploy/new` — Upload a base64 gzip tarball (with Dockerfile) and deploy a container. Returns `deploy_id`, `status`, `url`, `build_logs_url`. Requires `INSTANODE_TOKEN`. |
+| `create_deploy`   | `POST /deploy/new` — Upload a base64 gzip tarball (with Dockerfile) and deploy a container. Returns `deploy_id`, `status`, `url`, `build_logs_url`. `name` required. Requires `INSTANODE_TOKEN`. |
 | `list_deployments`| `GET /api/v1/deployments` — List all deployments on the caller's team. Requires `INSTANODE_TOKEN`.                                                                |
 | `get_deployment`  | `GET /api/v1/deployments/:id` — Fetch one deployment (poll until `status="running"`). Requires `INSTANODE_TOKEN`.                                                 |
 | `redeploy`        | `POST /deploy/:id/redeploy` — Rebuild + rolling update an existing deployment. Requires `INSTANODE_TOKEN`.                                                        |
@@ -144,7 +144,9 @@ const tarball_base64 = tar.toString("base64");
 ```
 
 Cap: 50 MB after decode. Honor `.dockerignore` — only ship what
-`docker build` needs.
+`docker build` needs. The `name` field is required (1–64 chars,
+letters/numbers/spaces/dashes) — it's the human-readable label shown
+on the dashboard.
 
 **Binding provisioned resources:**
 

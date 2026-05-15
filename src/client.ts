@@ -181,8 +181,8 @@ export interface DeployDeleteResult {
 export interface CreateDeployParams {
   /** Base64-encoded gzip tarball (with Dockerfile + source). <50 MB after decode. */
   tarball_base64: string;
-  /** Optional friendly name. */
-  name?: string;
+  /** Human-readable name shown on the dashboard. Required (1-64 chars). */
+  name: string;
   /** Container HTTP port. Default 8080. */
   port?: number;
   /** Deploy env scope: production / staging / development. Default "production". */
@@ -286,7 +286,7 @@ export class InstantClient {
   private headers(): Record<string, string> {
     const h: Record<string, string> = {
       "Content-Type": "application/json",
-      "User-Agent": "instanode-mcp/0.9.0",
+      "User-Agent": "instanode-mcp/0.10.0",
     };
     const tok = this.bearerToken();
     if (tok) {
@@ -301,7 +301,7 @@ export class InstantClient {
    */
   private authHeaders(): Record<string, string> {
     const h: Record<string, string> = {
-      "User-Agent": "instanode-mcp/0.9.0",
+      "User-Agent": "instanode-mcp/0.10.0",
     };
     const tok = this.bearerToken();
     if (tok) {
@@ -506,7 +506,8 @@ export class InstantClient {
     const blob = new Blob([tarball], { type: "application/gzip" });
     form.append("tarball", blob, "app.tar.gz");
 
-    if (params.name) form.append("name", params.name);
+    // `name` is a required field on POST /deploy/new — always sent.
+    form.append("name", params.name);
     if (typeof params.port === "number") form.append("port", String(params.port));
     if (params.env) form.append("env", params.env);
 

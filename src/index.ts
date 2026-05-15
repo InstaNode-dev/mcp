@@ -642,6 +642,8 @@ vault is per-team, per-env; rotate without redeploying). 'env_vars' and
 'resource_bindings' are merged before being sent to the API; on collision,
 'resource_bindings' wins.
 
+The 'name' field is required (the human-readable label shown on the dashboard).
+
 Requires INSTANODE_TOKEN (anonymous tier cannot deploy).`,
   {
     tarball_base64: z
@@ -654,8 +656,9 @@ Requires INSTANODE_TOKEN (anonymous tier cannot deploy).`,
       .string()
       .min(1)
       .max(64)
-      .optional()
-      .describe("Optional friendly label (1–64 chars). Defaults to a server-generated slug."),
+      .describe(
+        "Human-readable name for this resource, 1-64 chars, letters/numbers/spaces/dashes — shown in the dashboard. Required."
+      ),
     port: z
       .number()
       .int()
