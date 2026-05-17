@@ -597,9 +597,10 @@ token, tier, status, name, and expiry.`,
 server.tool(
   "delete_resource",
   `Permanently delete one of the caller's resources
-(DELETE /api/v1/resources/{token}). Drops the underlying Postgres/Mongo
-database, Redis ACL user, NATS user, storage prefix, or clears the webhook's
-request log, then marks the row status='deleted'.
+(DELETE /api/v1/resources/{id}, where the {id} path param is the resource
+token). Drops the underlying Postgres/Mongo database, Redis ACL user, NATS
+user, storage prefix, or clears the webhook's request log, then marks the
+row status='deleted'.
 
 Paid tier only. Free-tier and anonymous resources auto-expire in 24h and
 cannot be deleted manually — the tool will surface the upgrade URL.
