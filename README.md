@@ -297,10 +297,39 @@ Rotate any time by calling `get_api_token`, which mints a fresh 30-day JWT.
 ```bash
 npm install
 npm run build
-# Integration test (optional — requires a running instanode.dev server.
-# For local k8s, port-forward first: kubectl port-forward -n instant svc/instant-api 8080:8080):
-INSTANODE_API_URL=http://localhost:8080 npm test
 ```
+
+### Tests
+
+`npm test` runs the **hermetic MCP integration suite** — it is the CI gate
+(`.github/workflows/ci.yml` runs it on every push and pull request; a failure
+blocks the merge).
+
+```bash
+npm test
+```
+
+The suite (`test/integration.test.ts`) spawns the real built server binary and
+drives it over the genuine MCP stdio protocol using the official SDK client,
+pointed at an in-process mock of the agent API (`test/mock-api.ts`). It needs
+no network, no cluster, and no secrets — `npm test` behaves identically in CI
+and locally. It exercises every registered tool: schemas, success + error
+responses (401 / 402 / 403 / 404 / 400), the multipart deploy path, bearer-token
+auth handling, and malformed-input rejection. Every test that creates a resource
+tears it down, and a final sweep asserts the backend ledger is empty.
+
+An **optional live smoke test** (`test/live-smoke.test.ts`) provisions a real
+Postgres and tears it down again — it is skipped unless explicitly enabled:
+
+```bash
+INSTANODE_LIVE_SMOKE=1 \
+INSTANODE_API_URL=http://localhost:8080 \
+INSTANODE_TOKEN=<paid bearer> \
+npm test
+```
+
+`npm run test:smoke` runs the legacy `test.sh` shell smoke test against a live
+API instead.
 
 ## License
 

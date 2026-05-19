@@ -1,5 +1,16 @@
 name: CI
 
+# MANDATORY gate. The `integration` job below runs the hermetic MCP
+# integration suite (test/integration.test.ts) on every push and pull
+# request to master/main. A failure blocks the merge — an MCP-server
+# change cannot land without proving every tool still works end-to-end
+# over the real MCP stdio protocol.
+#
+# The suite is hermetic: it spawns the built server binary and points it
+# at an in-process mock of the agent API (test/mock-api.ts), so it needs
+# no external network, no cluster, and no secrets. `npm test` locally
+# runs the exact same gate.
+
 on:
   push:
     branches: [master, main]
@@ -7,7 +18,8 @@ on:
     branches: [master, main]
 
 jobs:
-  build:
+  integration:
+    name: MCP integration suite (CI gate)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,7 +27,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
 
-      - run: npm ci
-      - run: npm run build
-      - run: npm test
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check + build the server
+        run: npm run build
+
+      # `npm test` runs `pretest` (tsc + tsc -p tsconfig.test.json) then
+      # `node --test dist-test/test/` — the hermetic integration suite.
+      # This is the gate: a non-zero exit fails the job and blocks merge.
+      - name: Run the hermetic MCP integration suite
+        run: npm test
