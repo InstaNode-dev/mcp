@@ -57,6 +57,23 @@ export const VALID_TOKEN = "test-bearer-pro-tier";
 /** A token the mock rejects with 401 — used to exercise bad-auth handling. */
 export const BAD_TOKEN = "test-bearer-revoked";
 
+/**
+ * A valid bearer token whose AuthMode is "pat" (Personal Access Token).
+ *
+ * The live API enforces "PATs cannot mint other PATs" — `POST /api/v1/auth/api-keys`
+ * returns 403 when the caller is themselves a PAT. The mock mirrors that contract
+ * via this fixture: any request authenticated with `PAT_TOKEN` is treated as a PAT,
+ * and `/api/v1/auth/api-keys` will return 403 with the documented error.
+ *
+ * Real-world note: the dashboard's "API token" UI mints PATs, and the MCP's
+ * `get_api_token` tool itself mints PATs. So the typical `INSTANODE_TOKEN`
+ * value IS a PAT — meaning `get_api_token` would 403 in its documented
+ * "rotate as needed" use case. The MCP's `get_api_token` tool surfaces a
+ * clear "use a session token, not a PAT" message on this 403; this fixture
+ * lets the integration test pin that behavior.
+ */
+export const PAT_TOKEN = "test-bearer-pat-pro-tier";
+
 export interface MockApiHandle {
   /** Base URL the MCP server should be pointed at (INSTANODE_API_URL). */
   url: string;
@@ -105,14 +122,44 @@ function sendJSON(res: ServerResponse, status: number, payload: unknown): void {
 }
 
 /** Classify the inbound Authorization header. */
-type AuthState = "anonymous" | "valid" | "bad";
+type AuthState = "anonymous" | "valid" | "pat" | "bad";
 function classifyAuth(req: IncomingMessage): AuthState {
   const h = req.headers["authorization"];
   if (!h) return "anonymous";
   const m = /^Bearer\s+(.+)$/.exec(Array.isArray(h) ? h[0] : h);
   if (!m) return "bad";
   if (m[1] === VALID_TOKEN) return "valid";
+  if (m[1] === PAT_TOKEN) return "pat";
   return "bad";
+}
+
+/**
+ * Live API name pattern: 1-64 chars, must start with a letter or digit, then
+ * letters/digits/spaces/underscores/hyphens. Sourced verbatim from
+ * `ProvisionRequest.name.pattern` in api/internal/handlers/openapi.go (and the
+ * runtime validator in provision_helper.go:558-662). The previous mock only
+ * checked `name.length===0` which masked the MCP's name-pattern gap — adding
+ * the regex here means the mock now rejects bad names with `invalid_name`
+ * the same way prod does.
+ */
+const API_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 _-]*$/;
+
+/** Returns the validation error code (or null if name is valid). */
+function validateName(name: unknown): { error: string; message: string } | null {
+  if (typeof name !== "string" || name.length === 0) {
+    return { error: "name_required", message: "name is required" };
+  }
+  if (name.length > 64) {
+    return { error: "invalid_name", message: "name must be 1-64 characters" };
+  }
+  if (!API_NAME_PATTERN.test(name)) {
+    return {
+      error: "invalid_name",
+      message:
+        "name must start with a letter or digit, then letters/digits/spaces/underscores/hyphens",
+    };
+  }
+  return null;
 }
 
 /** Standard error envelope, matching the real API's shape. */
@@ -144,7 +191,8 @@ function provisionResponse(
 ): Record<string, unknown> {
   const id = randomUUID();
   const token = randomUUID();
-  const tier = auth === "valid" ? "pro" : "anonymous";
+  const paid = auth === "valid" || auth === "pat";
+  const tier = paid ? "pro" : "anonymous";
   const resource: MockResource = {
     id,
     token,
@@ -153,7 +201,7 @@ function provisionResponse(
     status: "active",
     name,
     created_at: nowIso(),
-    expires_at: auth === "valid" ? null : expiry24h(),
+    expires_at: paid ? null : expiry24h(),
   };
   state.resources.set(token, resource);
   state.provisionCalls += 1;
@@ -166,13 +214,12 @@ function provisionResponse(
     tier,
     env: "development",
     expires_at: resource.expires_at,
-    limits:
-      auth === "valid"
-        ? { storage_mb: 10240, connections: 20 }
-        : { storage_mb: 10, connections: 2, expires_in: "24h" },
+    limits: paid
+      ? { storage_mb: 10240, connections: 20 }
+      : { storage_mb: 10, connections: 2, expires_in: "24h" },
     ...extra,
   };
-  if (auth !== "valid") {
+  if (!paid) {
     body["note"] =
       "Anonymous resource — expires in 24h. Claim it to keep it permanently.";
     body["upgrade"] = "https://api.instanode.dev/start?t=mock.upgrade.jwt";
@@ -300,15 +347,12 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
       sendJSON(res, 400, errorEnvelope({ error: "bad_request", message: "malformed JSON body" }));
       return;
     }
-    const name = typeof parsed.name === "string" ? parsed.name : "";
-    if (name.length === 0) {
-      sendJSON(
-        res,
-        400,
-        errorEnvelope({ error: "bad_request", message: "name is required" })
-      );
+    const nameErr = validateName(parsed.name);
+    if (nameErr) {
+      sendJSON(res, 400, errorEnvelope(nameErr));
       return;
     }
+    const name = parsed.name as string;
     const extra: Record<string, unknown> = {};
     if (resourceType === "postgres" || resourceType === "cache" || resourceType === "nosql" || resourceType === "queue") {
       const scheme =
@@ -334,7 +378,15 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
     return;
   }
 
+  // Any authenticated session — covers session JWTs *and* PATs. The /api/v1/auth/api-keys
+  // route is the one exception (it requires a session, not a PAT) and handles that
+  // distinction in its own branch below.
+  const authed = auth === "valid" || auth === "pat";
+
   // ── POST /claim ────────────────────────────────────────────────────────────
+  // Per openapi.json: returns 200 ClaimResponse {ok, team_id, user_id, session_token,
+  // message} — the magic-link flow. The legacy 201 direct-claim shape (the old
+  // {id, token, resource_type, tier, status} body) has been retired in the live API.
   if (method === "POST" && path === "/claim") {
     const raw = await readBody(req);
     let parsed: { jwt?: unknown; email?: unknown };
@@ -362,19 +414,17 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
     }
     sendJSON(res, 200, {
       ok: true,
-      id: randomUUID(),
-      token: randomUUID(),
-      resource_type: "postgres",
-      name: "claimed-resource",
-      tier: "free",
-      status: "active",
+      team_id: randomUUID(),
+      user_id: randomUUID(),
+      session_token: `session.${randomUUID()}.jwt`,
+      message: "Magic link sent to email",
     });
     return;
   }
 
   // ── GET /api/v1/resources ──────────────────────────────────────────────────
   if (method === "GET" && path === "/api/v1/resources") {
-    if (auth !== "valid") {
+    if (!authed) {
       sendJSON(res, 401, errorEnvelope({ error: "unauthorized", message: "bearer token required" }));
       return;
     }
@@ -385,7 +435,7 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
 
   // ── DELETE /api/v1/resources/:token ────────────────────────────────────────
   if (method === "DELETE" && path.startsWith("/api/v1/resources/")) {
-    if (auth !== "valid") {
+    if (!authed) {
       sendJSON(res, 401, errorEnvelope({ error: "unauthorized", message: "bearer token required" }));
       return;
     }
@@ -413,23 +463,72 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
   }
 
   // ── POST /api/v1/auth/api-keys ─────────────────────────────────────────────
+  // Per openapi.json: "PATs cannot mint other PATs (the request fails with 403 when
+  // the caller is themselves a PAT, not a user session)." Mirrors api/internal/
+  // handlers/openapi.go and the live api's auth middleware AuthMode==pat gate.
+  // `name` is required (not optional) and scopes are restricted to read/write/admin.
   if (method === "POST" && path === "/api/v1/auth/api-keys") {
-    if (auth !== "valid") {
+    if (!authed) {
       sendJSON(res, 401, errorEnvelope({ error: "unauthorized", message: "bearer token required" }));
       return;
     }
+    if (auth === "pat") {
+      sendJSON(
+        res,
+        403,
+        errorEnvelope({
+          error: "pat_cannot_mint_pat",
+          message:
+            "Personal Access Tokens cannot mint other PATs — use a browser session JWT (sign in at https://instanode.dev/dashboard).",
+        })
+      );
+      return;
+    }
     const raw = await readBody(req);
-    let parsed: { name?: unknown } = {};
+    let parsed: { name?: unknown; scopes?: unknown } = {};
     try {
       parsed = raw.length > 0 ? JSON.parse(raw.toString("utf8")) : {};
     } catch {
       sendJSON(res, 400, errorEnvelope({ error: "bad_request", message: "malformed JSON body" }));
       return;
     }
+    if (typeof parsed.name !== "string" || parsed.name.length === 0) {
+      sendJSON(res, 400, errorEnvelope({ error: "name_required", message: "name is required" }));
+      return;
+    }
+    if (parsed.name.length > 120) {
+      sendJSON(
+        res,
+        400,
+        errorEnvelope({ error: "invalid_name", message: "name must be 1-120 characters" })
+      );
+      return;
+    }
+    if (parsed.scopes !== undefined) {
+      if (!Array.isArray(parsed.scopes)) {
+        sendJSON(
+          res,
+          400,
+          errorEnvelope({ error: "invalid_scopes", message: "scopes must be an array of strings" })
+        );
+        return;
+      }
+      for (const s of parsed.scopes) {
+        if (s !== "read" && s !== "write" && s !== "admin") {
+          sendJSON(
+            res,
+            400,
+            errorEnvelope({ error: "invalid_scopes", message: `invalid scope: ${String(s)}` })
+          );
+          return;
+        }
+      }
+    }
     sendJSON(res, 201, {
       ok: true,
       id: randomUUID(),
-      name: typeof parsed.name === "string" ? parsed.name : "instanode-mcp",
+      name: parsed.name,
+      scopes: Array.isArray(parsed.scopes) ? parsed.scopes : ["read", "write", "admin"],
       key: `ik_live_${randomUUID().replace(/-/g, "")}`,
       created_at: nowIso(),
     });
@@ -438,7 +537,7 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
 
   // ── POST /deploy/new (multipart) ───────────────────────────────────────────
   if (method === "POST" && path === "/deploy/new") {
-    if (auth !== "valid") {
+    if (!authed) {
       sendJSON(res, 401, errorEnvelope({ error: "unauthorized", message: "deploy requires authentication" }));
       return;
     }
@@ -462,8 +561,9 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
       );
       return;
     }
-    if (!fields["name"] || fields["name"].length === 0) {
-      sendJSON(res, 400, errorEnvelope({ error: "bad_request", message: "name field is required" }));
+    const nameErr = validateName(fields["name"]);
+    if (nameErr) {
+      sendJSON(res, 400, errorEnvelope(nameErr));
       return;
     }
 
@@ -547,7 +647,7 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
 
   // ── GET /api/v1/deployments ────────────────────────────────────────────────
   if (method === "GET" && path === "/api/v1/deployments") {
-    if (auth !== "valid") {
+    if (!authed) {
       sendJSON(res, 401, errorEnvelope({ error: "unauthorized", message: "bearer token required" }));
       return;
     }
@@ -558,7 +658,7 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
 
   // ── GET /api/v1/deployments/:id ────────────────────────────────────────────
   if (method === "GET" && path.startsWith("/api/v1/deployments/")) {
-    if (auth !== "valid") {
+    if (!authed) {
       sendJSON(res, 401, errorEnvelope({ error: "unauthorized", message: "bearer token required" }));
       return;
     }
@@ -579,8 +679,12 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
   }
 
   // ── POST /deploy/:id/redeploy ──────────────────────────────────────────────
+  // Per openapi.json: bare 202 response, NO body schema. The previous mock returned
+  // {ok, item: deployment} — that masked a real prod bug where the MCP client typed
+  // the response as DeployGetResult and dereferenced .item.app_id, throwing on the
+  // empty-body 202 from the real API. T17 P0-1.
   if (method === "POST" && /^\/deploy\/[^/]+\/redeploy$/.test(path)) {
-    if (auth !== "valid") {
+    if (!authed) {
       sendJSON(res, 401, errorEnvelope({ error: "unauthorized", message: "bearer token required" }));
       return;
     }
@@ -593,13 +697,15 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
     deployment.status = "building";
     deployment.url = "";
     deployment.updated_at = nowIso();
-    sendJSON(res, 202, { ok: true, item: deployment });
+    // Bare 202 — Content-Length 0, no body. Matches the live API contract verbatim.
+    res.writeHead(202);
+    res.end();
     return;
   }
 
   // ── DELETE /deploy/:id ─────────────────────────────────────────────────────
   if (method === "DELETE" && /^\/deploy\/[^/]+$/.test(path)) {
-    if (auth !== "valid") {
+    if (!authed) {
       sendJSON(res, 401, errorEnvelope({ error: "unauthorized", message: "bearer token required" }));
       return;
     }

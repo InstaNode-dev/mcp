@@ -31,8 +31,40 @@
  * client to the canonical routes above.
  */
 
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
 const DEFAULT_BASE_URL = "https://api.instanode.dev";
 const DEFAULT_DASHBOARD_URL = "https://instanode.dev";
+
+/**
+ * Resolve this package's version from the installed package.json EXACTLY ONCE
+ * at module load. Previously the User-Agent string was a hardcoded literal
+ * ("instanode-mcp/0.11.0") in two places — every version bump silently lied
+ * to server-side analytics and rate-limit attribution. T17 P1.
+ *
+ * Reads relative to this file's compiled location (dist/client.js → ../package.json).
+ * Falls back to "dev" if the file is missing or unreadable — never crashes the
+ * client, since the User-Agent is informational.
+ */
+function resolvePkgVersion(): string {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const pkgPath = resolve(here, "..", "package.json");
+    const raw = readFileSync(pkgPath, "utf8");
+    const parsed = JSON.parse(raw) as { version?: unknown };
+    if (typeof parsed.version === "string" && parsed.version.length > 0) {
+      return parsed.version;
+    }
+  } catch {
+    // Fall through to the sentinel.
+  }
+  return "dev";
+}
+
+const PKG_VERSION = resolvePkgVersion();
+const USER_AGENT = `instanode-mcp/${PKG_VERSION}`;
 
 export interface ClientOptions {
   baseURL?: string;
@@ -190,6 +222,23 @@ export interface DeployListResult {
 export interface DeployGetResult {
   ok: boolean;
   item: Deployment;
+}
+
+/**
+ * Response shape for POST /deploy/:id/redeploy.
+ *
+ * The live API contract (api/internal/handlers/openapi.go:397-407) documents
+ * this endpoint as a bare 202 with NO body schema — the previous mcp client
+ * typed it as `DeployGetResult` and dereferenced `result.item.app_id`, which
+ * threw a TypeError against the real API. We now model it explicitly as a
+ * fire-and-forget acknowledgement: just `{ ok: true }`, with `id` populated
+ * client-side from the request so the caller still has something to surface.
+ * T17 P0-1.
+ */
+export interface RedeployResult {
+  ok: boolean;
+  /** Echoed from the request path so callers don't need to remember it. */
+  id: string;
 }
 
 export interface DeployDeleteResult {
@@ -360,7 +409,7 @@ export class InstantClient {
   private headers(): Record<string, string> {
     const h: Record<string, string> = {
       "Content-Type": "application/json",
-      "User-Agent": "instanode-mcp/0.11.0",
+      "User-Agent": USER_AGENT,
     };
     const tok = this.bearerToken();
     if (tok) {
@@ -375,7 +424,7 @@ export class InstantClient {
    */
   private authHeaders(): Record<string, string> {
     const h: Record<string, string> = {
-      "User-Agent": "instanode-mcp/0.11.0",
+      "User-Agent": USER_AGENT,
     };
     const tok = this.bearerToken();
     if (tok) {
@@ -715,14 +764,30 @@ export class InstantClient {
     );
   }
 
-  /** POST /deploy/:id/redeploy — rebuild + rolling update an existing app. */
-  async redeploy(id: string): Promise<DeployGetResult> {
-    return this.request<DeployGetResult>(
+  /**
+   * POST /deploy/:id/redeploy — rebuild + rolling update an existing app.
+   *
+   * The live API returns a bare 202 with NO body (api/internal/handlers/openapi.go
+   * documents this explicitly). The previous implementation typed the response as
+   * `DeployGetResult` and the index.ts handler dereferenced `result.item.app_id`,
+   * which threw `TypeError: Cannot read properties of undefined (reading 'app_id')`
+   * against the real API every time. The hermetic mock used to fabricate
+   * `{ ok, item }` which masked the bug. T17 P0-1.
+   *
+   * We treat the call as fire-and-forget: any 2xx (typically 202) is success;
+   * any non-2xx flows through the normal ApiError path. The returned `id` is
+   * just the path param echoed back so the caller has something to surface.
+   */
+  async redeploy(id: string): Promise<RedeployResult> {
+    // `request<T>` returns `undefined` for an empty 2xx body — that's fine,
+    // we don't read it. The throw paths still fire normally on non-2xx.
+    await this.request<unknown>(
       "POST",
       `/deploy/${encodeURIComponent(id)}/redeploy`,
       undefined,
       { requireAuth: true }
     );
+    return { ok: true, id };
   }
 
   /** DELETE /deploy/:id — tear down the running pod + remove the record. */

@@ -42,7 +42,8 @@ import { dirname, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
-import { startMockApi, type MockApiHandle, VALID_TOKEN, BAD_TOKEN } from "./mock-api.js";
+import { readFileSync } from "node:fs";
+import { startMockApi, type MockApiHandle, VALID_TOKEN, BAD_TOKEN, PAT_TOKEN } from "./mock-api.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // The server is built to dist/index.js (tsconfig rootDir=src, outDir=dist).
@@ -79,7 +80,7 @@ const EXPECTED_TOOLS = [
  */
 async function connectClient(
   apiUrl: string,
-  token: "valid" | "bad" | "none"
+  token: "valid" | "bad" | "none" | "pat"
 ): Promise<{ client: Client; close: () => Promise<void> }> {
   const env: Record<string, string> = {
     INSTANODE_API_URL: apiUrl,
@@ -88,6 +89,7 @@ async function connectClient(
   };
   if (token === "valid") env["INSTANODE_TOKEN"] = VALID_TOKEN;
   if (token === "bad") env["INSTANODE_TOKEN"] = BAD_TOKEN;
+  if (token === "pat") env["INSTANODE_TOKEN"] = PAT_TOKEN;
 
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -819,4 +821,416 @@ describe("instanode-mcp integration suite", () => {
       }
     });
   });
+
+  // ── BugBash 2026-05-20 regression tests ────────────────────────────────────
+  //
+  // Each `it()` here pins exactly one of the T17 findings so a future change
+  // that reverts a fix fails this suite immediately. Keep them grouped (and
+  // their issue refs in the title) so the failure message points straight at
+  // the original report.
+
+  describe("BugBash 2026-05-20 T17 P0-1 — redeploy tolerates bare-202 empty body", () => {
+    it("redeploy resolves successfully when the api returns 202 with no body (no TypeError on result.item.app_id)", async () => {
+      // The live api documents POST /deploy/{id}/redeploy as a bare 202 with
+      // no body schema. The previous client typed it as DeployGetResult and
+      // the index.ts handler dereferenced `result.item.app_id`, throwing
+      // `TypeError: Cannot read properties of undefined (reading 'app_id')`.
+      // The fixed mock now returns a bare 202 (no JSON body) so this test
+      // genuinely exercises the empty-body path. T17 P0-1.
+      const { client, close } = await connectClient(mock.url, "valid");
+      let appId = "";
+      try {
+        const created = await client.callTool({
+          name: "create_deploy",
+          arguments: { tarball_base64: fakeTarballBase64(), name: "it-redeploy-bare-202" },
+        });
+        appId = /Deploy ID:\s+(\S+)/.exec(resultText(created))![1];
+
+        // Promote building → running by polling once.
+        await client.callTool({ name: "get_deployment", arguments: { id: appId } });
+
+        // The act: redeploy must not throw, must include a clear "Redeploy
+        // accepted" headline, and must NOT contain any sign of an undefined
+        // dereference (the old failure mode).
+        const res = await client.callTool({ name: "redeploy", arguments: { id: appId } });
+        const text = resultText(res);
+        assert.ok(text.includes("Redeploy accepted"), `expected a clean redeploy headline:\n${text}`);
+        assert.ok(text.includes(appId), `expected the redeploy output to echo the id ${appId}:\n${text}`);
+        assert.ok(
+          !/undefined|cannot read prop|TypeError/i.test(text),
+          `redeploy output looks like an undefined-deref crash:\n${text}`
+        );
+        // The result must not advertise a status or URL field the api didn't
+        // give us — the bare-202 contract has neither.
+        assert.ok(
+          !text.includes("Status: running"),
+          `redeploy must not claim a status it did not receive:\n${text}`
+        );
+      } finally {
+        await close();
+      }
+      // CLEANUP
+      const { client: c2, close: close2 } = await connectClient(mock.url, "valid");
+      try {
+        await c2.callTool({ name: "delete_deployment", arguments: { id: appId } });
+      } finally {
+        await close2();
+      }
+    });
+  });
+
+  describe("BugBash 2026-05-20 T17 P0-2 — get_api_token surfaces a clear error for PATs", () => {
+    it("get_api_token with a PAT bearer surfaces the 'use a session JWT' message (not a generic 403)", async () => {
+      // The live api enforces "PATs cannot mint other PATs" — a 403 with code
+      // `pat_cannot_mint_pat` on POST /api/v1/auth/api-keys when the caller is
+      // a PAT. Since `get_api_token` itself mints PATs, the typical INSTANODE_TOKEN
+      // value IS a PAT — meaning this tool fails 100% of the time in its
+      // documented "rotate as needed" use case unless the user surfaces the
+      // restriction. T17 P0-2.
+      const { client, close } = await connectClient(mock.url, "pat");
+      try {
+        const res = await client.callTool({ name: "get_api_token", arguments: {} });
+        const text = resultText(res);
+        // Headline must name the constraint plainly. Looking for the canonical
+        // failure-mode keywords; if the message ever drifts away from these,
+        // an agent reading the output will be unable to recover.
+        assert.ok(/Personal Access Token|PAT/i.test(text), `expected a PAT-aware error message:\n${text}`);
+        assert.ok(/session/i.test(text), `expected the error to mention a session JWT:\n${text}`);
+        assert.ok(text.includes("instanode.dev/dashboard"), `expected the dashboard link:\n${text}`);
+        // The generic "instanode.dev error (403):" preamble (which produced
+        // confused agent retries) MUST NOT be the entire headline.
+        assert.ok(
+          !/^instanode\.dev error \(403\): upstream error\s*$/.test(text.trim()),
+          `error fell through to the generic 403 path:\n${text}`
+        );
+      } finally {
+        await close();
+      }
+    });
+
+    it("get_api_token tool description mentions the session-vs-PAT requirement", async () => {
+      // Locking the description down prevents the "rotate as needed" claim
+      // from creeping back in. The fix at T17 P0-2 rewrote the description
+      // to explicitly state PATs can't mint PATs.
+      const { client, close } = await connectClient(mock.url, "none");
+      try {
+        const { tools } = await client.listTools();
+        const tool = tools.find((t) => t.name === "get_api_token")!;
+        const desc = tool.description ?? "";
+        assert.ok(/PAT|Personal Access Token/i.test(desc), "get_api_token description must mention PATs");
+        assert.ok(/session/i.test(desc), "get_api_token description must mention session JWTs");
+        assert.ok(!/rotate as needed/i.test(desc), "the misleading 'rotate as needed' line must be gone");
+      } finally {
+        await close();
+      }
+    });
+  });
+
+  describe("BugBash 2026-05-20 T17 P1 — name schema mirrors the live api regex", () => {
+    // The api enforces `^[A-Za-z0-9][A-Za-z0-9 _-]*$` (start-alnum then
+    // letters/digits/spaces/underscores/hyphens, 1-64 chars). The previous
+    // mcp schema used `min(1).max(64)` only — names like "-bad" or "@x"
+    // passed locally and 400'd on the api with a generic invalid_name.
+    // T17 P1-1.
+    const REJECTED = [
+      "-leading-dash",
+      " starts-with-space",
+      "@invalid",
+      ".dotty",
+      "has/slash",
+      "name\twith\ttab",
+    ];
+    const ACCEPTED = [
+      "valid-name",
+      "valid_name",
+      "Valid Name 1",
+      "123start",
+      "a",
+    ];
+
+    for (const bad of REJECTED) {
+      it(`create_postgres rejects ${JSON.stringify(bad)} at the zod regex layer (no round-trip to the api)`, async () => {
+        const { client, close } = await connectClient(mock.url, "none");
+        try {
+          const res = await client.callTool({ name: "create_postgres", arguments: { name: bad } });
+          assert.ok(
+            (res as { isError?: boolean }).isError === true,
+            `create_postgres accepted ${JSON.stringify(bad)}: ${JSON.stringify(res)}`
+          );
+        } finally {
+          await close();
+        }
+      });
+    }
+
+    for (const good of ACCEPTED) {
+      it(`create_postgres accepts ${JSON.stringify(good)} (matches the live api pattern)`, async () => {
+        const { client, close } = await connectClient(mock.url, "none");
+        try {
+          const res = await client.callTool({ name: "create_postgres", arguments: { name: good } });
+          assert.ok(
+            (res as { isError?: boolean }).isError !== true,
+            `create_postgres rejected ${JSON.stringify(good)} which should be valid: ${JSON.stringify(res)}`
+          );
+        } finally {
+          await close();
+        }
+      });
+    }
+
+    it("create_deploy mirrors the same name regex (start-alnum, no leading dash)", async () => {
+      const { client, close } = await connectClient(mock.url, "valid");
+      try {
+        const res = await client.callTool({
+          name: "create_deploy",
+          arguments: { tarball_base64: fakeTarballBase64(), name: "-leading-dash" },
+        });
+        assert.ok(
+          (res as { isError?: boolean }).isError === true,
+          `create_deploy accepted a leading-dash name: ${JSON.stringify(res)}`
+        );
+      } finally {
+        await close();
+      }
+    });
+
+    it("every create_* tool's name schema has a non-empty pattern (coverage block — guards against single-site fallacy)", async () => {
+      // Enumerate every create_* tool the registry advertises and assert
+      // each one carries a non-empty regex pattern on its `name` field.
+      // The previous build added the regex to `create_deploy` but missed
+      // the shared `nameArg` (single-site fallacy); the fix updated both,
+      // and this test fails if either drifts away from the api contract.
+      const { client, close } = await connectClient(mock.url, "none");
+      try {
+        const { tools } = await client.listTools();
+        const namedCreates = tools.filter((t) => /^create_/.test(t.name));
+        assert.ok(namedCreates.length >= 7, `expected ≥7 create_* tools, got ${namedCreates.length}`);
+        for (const tool of namedCreates) {
+          const schema = tool.inputSchema as {
+            properties?: Record<string, { type?: string; pattern?: string }>;
+          };
+          const nameProp = schema.properties?.["name"];
+          assert.ok(nameProp, `${tool.name} has no name property`);
+          assert.ok(
+            typeof nameProp.pattern === "string" && nameProp.pattern.length > 0,
+            `${tool.name} name schema is missing the api regex (pattern=${JSON.stringify(nameProp.pattern)})`
+          );
+        }
+      } finally {
+        await close();
+      }
+    });
+  });
+
+  describe("BugBash 2026-05-20 T17 P1 — User-Agent reflects package.json version", () => {
+    it("client UA string equals 'instanode-mcp/<package.json version>' (no hardcoded 0.11.0 literal)", async () => {
+      // T17 P1-6: the client previously hardcoded "instanode-mcp/0.11.0" in two
+      // places. After a version bump, server-side analytics, rate-limit
+      // attribution, and abuse triage keyed on UA would see stale data forever.
+      // This test loads the real package.json + spawns the server pointed at
+      // a UA-capturing mock to confirm the UA is sourced from package.json.
+      const here = dirname(fileURLToPath(import.meta.url));
+      const pkgPath = resolve(here, "..", "..", "package.json");
+      const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { version: string };
+      const expectedUA = `instanode-mcp/${pkg.version}`;
+
+      // Capture the UA on a real http.Server pointed at the spawned mcp.
+      const observedUAs: string[] = [];
+      const captureServer = await createMockApiThatCapturesUA(observedUAs);
+      try {
+        const { client, close } = await connectClient(captureServer.url, "none");
+        try {
+          // Any tool that triggers an HTTP call works — create_postgres on
+          // anonymous tier hits POST /db/new without auth.
+          await client.callTool({ name: "create_postgres", arguments: { name: "it-ua-check" } });
+        } finally {
+          await close();
+        }
+      } finally {
+        await captureServer.close();
+      }
+
+      assert.ok(observedUAs.length > 0, "no requests reached the UA-capture server");
+      for (const ua of observedUAs) {
+        assert.equal(
+          ua,
+          expectedUA,
+          `User-Agent mismatch: expected ${expectedUA}, got ${ua}`
+        );
+      }
+      // Anti-drift guard against the literal that used to be hardcoded.
+      // If anyone ever re-pins a hardcoded "instanode-mcp/<bumped-version>",
+      // this assert fires the moment package.json moves past that version.
+      assert.ok(
+        !observedUAs.some((u) => /instanode-mcp\/0\.11\.0/.test(u)) ||
+          pkg.version === "0.11.0",
+        `client is still sending the old hardcoded 0.11.0 UA after a version bump (saw ${observedUAs.join(", ")})`
+      );
+    });
+  });
+
+  describe("BugBash 2026-05-20 T17 P0/P1 — mock-api contract pinning", () => {
+    // These tests don't drive the mcp server — they sanity-check the mock
+    // itself against the live openapi.json contract. If the mock ever drifts
+    // back to its earlier fiction (a 202 with `{ok,item}`, an api-keys 201
+    // for any caller, the legacy direct-claim shape), these fire.
+
+    it("POST /deploy/:id/redeploy returns a bare 202 with no body (matches openapi.json)", async () => {
+      // T17 P0-1: the prior mock returned {ok, item: deployment} on 202,
+      // letting the broken redeploy client pass tests against fiction.
+      const { client, close } = await connectClient(mock.url, "valid");
+      let appId = "";
+      try {
+        const created = await client.callTool({
+          name: "create_deploy",
+          arguments: { tarball_base64: fakeTarballBase64(), name: "it-mock-bare202" },
+        });
+        appId = /Deploy ID:\s+(\S+)/.exec(resultText(created))![1];
+
+        // Direct fetch — bypass the mcp client to inspect the raw response.
+        const resp = await fetch(`${mock.url}/deploy/${appId}/redeploy`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${VALID_TOKEN}` },
+        });
+        assert.equal(resp.status, 202, `expected 202, got ${resp.status}`);
+        const body = await resp.text();
+        assert.equal(body, "", `expected an empty body, got: ${body}`);
+      } finally {
+        await close();
+      }
+      // CLEANUP
+      const { client: c2, close: close2 } = await connectClient(mock.url, "valid");
+      try {
+        await c2.callTool({ name: "delete_deployment", arguments: { id: appId } });
+      } finally {
+        await close2();
+      }
+    });
+
+    it("POST /api/v1/auth/api-keys returns 403 pat_cannot_mint_pat when the caller is a PAT", async () => {
+      // T17 P0-2: the prior mock unconditionally returned 201 — masked the
+      // entire PAT-creating-PAT failure mode.
+      const resp = await fetch(`${mock.url}/api/v1/auth/api-keys`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${PAT_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ name: "should-be-rejected", scopes: ["read", "write"] }),
+      });
+      assert.equal(resp.status, 403, `expected 403, got ${resp.status}`);
+      const body = (await resp.json()) as { error?: string; message?: string };
+      assert.equal(body.error, "pat_cannot_mint_pat", `unexpected error code: ${JSON.stringify(body)}`);
+    });
+
+    it("POST /api/v1/auth/api-keys requires a name field (per openapi.json)", async () => {
+      // openapi.json marks `name` required on this endpoint; the prior mock
+      // accepted a missing name.
+      const resp = await fetch(`${mock.url}/api/v1/auth/api-keys`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${VALID_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({}),
+      });
+      assert.equal(resp.status, 400, `expected 400 for missing name, got ${resp.status}`);
+    });
+
+    it("POST /api/v1/auth/api-keys rejects an invalid scope (per openapi.json enum)", async () => {
+      const resp = await fetch(`${mock.url}/api/v1/auth/api-keys`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${VALID_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ name: "k", scopes: ["god"] }),
+      });
+      assert.equal(resp.status, 400, `expected 400 for bad scope, got ${resp.status}`);
+    });
+
+    it("POST /claim returns 200 with the ClaimResponse magic-link shape (not the legacy 201 direct-claim)", async () => {
+      // T17 P1-5: prior mock returned {id, token, resource_type, tier, status}
+      // — the legacy 201 shape the live api retired. The real response is
+      // {ok, team_id, user_id, session_token, message}.
+      const resp = await fetch(`${mock.url}/claim`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jwt: "ey.valid.jwt", email: "dev@example.com" }),
+      });
+      assert.equal(resp.status, 200, `expected 200, got ${resp.status}`);
+      const body = (await resp.json()) as Record<string, unknown>;
+      assert.equal(typeof body["ok"], "boolean", "missing ok");
+      assert.equal(typeof body["session_token"], "string", "missing session_token");
+      assert.ok("team_id" in body, "missing team_id");
+      assert.ok("user_id" in body, "missing user_id");
+      // The legacy fields MUST be gone — if they reappear, the mock has drifted.
+      assert.equal(body["resource_type"], undefined, "legacy resource_type leaked");
+      assert.equal(body["token"], undefined, "legacy token leaked");
+      assert.equal(body["tier"], undefined, "legacy tier leaked");
+    });
+
+    it("provisioning routes 400 on a name that fails the live api pattern (start-alnum + spaces/underscores/dashes)", async () => {
+      // Names like "-bad", "@x", "has/slash" pass the loose old mock and the
+      // loose old client schema but 400 on the live api. The mock now mirrors
+      // the regex so the test catches schema drift.
+      const resp = await fetch(`${mock.url}/db/new`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "-bad" }),
+      });
+      assert.equal(resp.status, 400, `expected 400 for bad name, got ${resp.status}`);
+      const body = (await resp.json()) as { error?: string };
+      assert.equal(body.error, "invalid_name", `unexpected error: ${JSON.stringify(body)}`);
+    });
+  });
 });
+
+// ── UA-capturing mock server (used by the User-Agent regression test only) ────
+//
+// A tiny http.Server that records every inbound User-Agent header and otherwise
+// responds like the anonymous-tier /db/new happy path. Kept separate from the
+// main mock so the rest of the suite is unaffected.
+import { createServer, type Server as HttpServer } from "node:http";
+
+async function createMockApiThatCapturesUA(
+  observed: string[]
+): Promise<{ url: string; close: () => Promise<void> }> {
+  const server: HttpServer = createServer((req, res) => {
+    const ua = req.headers["user-agent"];
+    if (typeof ua === "string") observed.push(ua);
+    // Drain the request body so the client sees the response.
+    req.on("data", () => undefined);
+    req.on("end", () => {
+      res.writeHead(201, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          id: "00000000-0000-0000-0000-000000000000",
+          token: "00000000-0000-0000-0000-000000000000",
+          name: "ua-check",
+          tier: "anonymous",
+          env: "development",
+          expires_at: null,
+          limits: { storage_mb: 10, connections: 2, expires_in: "24h" },
+          connection_url: "postgres://u:p@host/db",
+          note: "stub",
+          upgrade: "https://api.instanode.dev/start?t=stub",
+          upgrade_jwt: "stub",
+        })
+      );
+    });
+  });
+  await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  const addr = server.address();
+  if (addr === null || typeof addr === "string") throw new Error("UA mock failed to bind a port");
+  const url = `http://127.0.0.1:${addr.port}`;
+  return {
+    url,
+    close: () =>
+      new Promise<void>((resolveClose, rejectClose) => {
+        server.closeAllConnections();
+        server.close((err) => (err ? rejectClose(err) : resolveClose()));
+      }),
+  };
+}

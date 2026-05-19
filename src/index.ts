@@ -98,6 +98,18 @@ function formatError(err: unknown): string {
     } else if (err.status === 403 && err.code === "paid_tier_only") {
       headline =
         "Free-tier resource cannot be deleted — it will auto-expire in 24h.";
+    } else if (err.status === 403 && err.code === "pat_cannot_mint_pat") {
+      // The /api/v1/auth/api-keys "PAT-creating-a-PAT" gate. The current
+      // INSTANODE_TOKEN is itself a PAT (the dashboard's "API token" UI and
+      // get_api_token itself both mint PATs), so this is the overwhelmingly
+      // common failure mode. Surface a non-generic, actionable headline so
+      // the agent can route the user to the correct flow rather than retry.
+      // T17 P0-2.
+      headline =
+        "get_api_token requires a browser session JWT (not a Personal Access Token / PAT). " +
+        "Your current INSTANODE_TOKEN appears to be a PAT — PATs cannot mint new PATs. " +
+        "Sign in at https://instanode.dev/dashboard, then create a key from the dashboard's API token UI " +
+        "(or, if you have an existing valid key, just reuse it — PATs are revocation-based, not time-bound).";
     } else if (err.status === 429) {
       headline =
         "Rate limited (5 anonymous provisions/day per /24 subnet). " +
@@ -155,14 +167,32 @@ function appendUpgradeBlock(
   }
 }
 
+/**
+ * Live API name pattern, mirrored verbatim from the openapi.json spec
+ * (ProvisionRequest.name.pattern + provision_helper.go's runtime validator):
+ *
+ *   1-64 chars, must start with a letter or digit, then
+ *   letters / digits / spaces / underscores / hyphens.
+ *
+ * Names that pass the previous loose schema (min(1).max(64)) but fail this
+ * regex were silently accepted by the MCP and 400'd by the api — agents got
+ * a round-trip + generic "invalid_name" error instead of a precise local
+ * rejection. T17 P1-1. Sourced as a named constant per the user MEMORY rule
+ * "use named constants, not inline strings."
+ */
+const API_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 _-]*$/;
+const API_NAME_PATTERN_DESCRIPTION =
+  "must start with a letter or digit, then letters/digits/spaces/underscores/hyphens";
+
 // The single-character "name" schema reused by every create_* tool.
 const nameArg = {
   name: z
     .string()
     .min(1)
     .max(64)
+    .regex(API_NAME_PATTERN, `name format: ${API_NAME_PATTERN_DESCRIPTION}`)
     .describe(
-      "Human-readable label for this resource (1–64 chars). Surfaced on the dashboard. Example: 'prospector-agent', 'stripe-sandbox'."
+      `Human-readable label for this resource (1-64 chars; ${API_NAME_PATTERN_DESCRIPTION}). Surfaced on the dashboard. Example: 'prospector-agent', 'stripe-sandbox'.`
     ),
 };
 
@@ -632,15 +662,23 @@ Requires INSTANODE_TOKEN.`,
 
 server.tool(
   "get_api_token",
-  `Mint a fresh API key for the authenticated caller and return it as plain
-text (POST /api/v1/auth/api-keys). The user should paste the returned key
-into their MCP server config as INSTANODE_TOKEN (or export it as an env var
-for CLI use).
+  `Mint a fresh Personal Access Token (PAT) for the authenticated caller and
+return it as plain text (POST /api/v1/auth/api-keys).
 
-API keys are revocation-based (not time-bound) — they live until revoked
-in the dashboard. Requires an existing INSTANODE_TOKEN to bootstrap a new
-one; the typical flow is: claim once via the dashboard (browser), mint a
-key, paste it into the MCP env, then use this tool to rotate as needed.`,
+IMPORTANT — this tool requires a browser SESSION JWT, not a PAT. PATs cannot
+mint other PATs (the api enforces this with a 403). If your INSTANODE_TOKEN
+came from the dashboard's "API token" UI, or from a previous get_api_token
+call, it is a PAT and this tool will fail with a clear 403 message.
+
+The intended flow is:
+  1. Sign in at https://instanode.dev/dashboard (cookie-based session).
+  2. Use that browser session to create a PAT in the dashboard's API token UI.
+  3. Paste the PAT into your MCP config as INSTANODE_TOKEN.
+
+PATs are revocation-based (not time-bound) — they live until you revoke them
+in the dashboard, so "rotation" is best done by minting a new key in the
+dashboard UI and revoking the old one, NOT by calling this tool from an
+agent context.`,
   {
     name: z
       .string()
@@ -729,8 +767,9 @@ Requires INSTANODE_TOKEN (anonymous tier cannot deploy).`,
       .string()
       .min(1)
       .max(64)
+      .regex(API_NAME_PATTERN, `name format: ${API_NAME_PATTERN_DESCRIPTION}`)
       .describe(
-        "Human-readable name for this resource, 1-64 chars, letters/numbers/spaces/dashes — shown in the dashboard. Required."
+        `Human-readable name for this deploy, 1-64 chars (${API_NAME_PATTERN_DESCRIPTION}). Shown in the dashboard. Required.`
       ),
     port: z
       .number()
@@ -923,14 +962,16 @@ Requires INSTANODE_TOKEN.`,
   },
   async ({ id }) => {
     try {
+      // `redeploy()` resolves with `{ ok, id }` only — the live API returns a
+      // bare 202 with no body, so we never have a fresh deployment object here.
+      // The caller will see the new status by polling get_deployment. T17 P0-1.
       const result = await client.redeploy(id);
-      const d = result.item;
       const lines = [
-        `Redeploy accepted for ${d.app_id}.`,
-        `Status: ${d.status}`,
+        `Redeploy accepted for ${result.id}.`,
+        `Status: building (rebuild kicked off by the api)`,
+        ``,
+        `Poll get_deployment({ id: "${result.id}" }) until status="running".`,
       ];
-      if (d.url) lines.push(`URL:    ${d.url}`);
-      lines.push(``, `Poll get_deployment({ id: "${d.app_id}" }) until status="running".`);
       return textResult(lines.join("\n"));
     } catch (err) {
       return textResult(formatError(err));
