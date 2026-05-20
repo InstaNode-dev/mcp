@@ -34,7 +34,7 @@ import sys, json
 d = json.loads(sys.stdin.read())
 tools = {t['name'] for t in d['result']['tools']}
 expected = {
-    'create_postgres', 'create_cache', 'create_nosql', 'create_queue',
+    'create_postgres', 'create_vector', 'create_cache', 'create_nosql', 'create_queue',
     'create_storage', 'create_webhook',
     'create_deploy', 'list_deployments', 'get_deployment',
     'redeploy', 'delete_deployment',
@@ -52,7 +52,7 @@ assert not still_there, f'dead tools still registered: {still_there}'
 extra = tools - expected
 assert not extra, f'unexpected tools registered: {extra}'
 " || fail "tools/list missing expected tools or carrying dead ones"
-pass "tools/list returns all 16 tools, no dead ones"
+pass "tools/list returns all 17 tools, no dead ones"
 
 # Test 2b: tools/list — deploy management tools are registered and discoverable.
 # Explicit assertion so the smoke test catches a regression on any single one.
@@ -88,6 +88,34 @@ err = d.get('error') or (d.get('result') or {}).get('isError')
 assert err, f'expected a validation error, got: {d}'
 " || fail "create_postgres with empty name was accepted"
 pass "create_postgres rejects empty name"
+
+# Test 4b: create_vector (B16-F10) is registered and rejects an empty name.
+# Also verifies the optional dimensions field is advertised in the schema.
+BAD_VECTOR='{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"create_vector","arguments":{"name":""}}}'
+RESP=$(printf "%s\n%s\n" "$INIT" "$BAD_VECTOR" | INSTANODE_API_URL="$BASE_URL" $MCP 2>/dev/null | tail -1)
+echo "$RESP" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+err = d.get('error') or (d.get('result') or {}).get('isError')
+assert err, f'expected a validation error, got: {d}'
+" || fail "create_vector with empty name was accepted"
+pass "create_vector rejects empty name"
+
+# Test 4c: create_vector schema advertises optional dimensions
+RESP=$(printf "%s\n%s\n" "$INIT" "$TOOLS_LIST" | INSTANODE_API_URL="$BASE_URL" $MCP 2>/dev/null | tail -1)
+echo "$RESP" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+tools = {t['name']: t for t in d['result']['tools']}
+assert 'create_vector' in tools, f'create_vector not registered'
+schema = tools['create_vector']['inputSchema']
+props = schema.get('properties', {})
+assert 'name' in props, f'create_vector missing name: {list(props.keys())}'
+assert 'dimensions' in props, f'create_vector missing dimensions: {list(props.keys())}'
+desc = tools['create_vector'].get('description', '')
+assert 'pgvector' in desc.lower(), f'create_vector description should mention pgvector'
+" || fail "create_vector schema missing expected properties"
+pass "create_vector schema advertises name + dimensions and mentions pgvector"
 
 # Test 5: claim_resource is a pure helper — works without any API/network access.
 # Accepts a raw JWT and builds the dashboard claim URL.

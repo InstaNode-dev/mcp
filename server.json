@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.InstaNode-dev/mcp",
-  "description": "Provision Postgres databases + webhooks from AI coding agents in one HTTP call.",
+  "description": "Provision Postgres (with pgvector), Redis, MongoDB, NATS JetStream queues, S3-compatible object storage, inbound webhook receivers, and deploy containerized apps from AI coding agents in single HTTP calls.",
   "repository": {
     "url": "https://github.com/InstaNode-dev/mcp",
     "source": "github"
