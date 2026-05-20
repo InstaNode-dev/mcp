@@ -64,6 +64,20 @@ function resolveUserAgent(): string {
 
 const USER_AGENT = resolveUserAgent();
 
+/**
+ * Maximum decoded tarball size accepted by POST /deploy/new (50 MiB,
+ * mirroring the api's documented contract). T17 P2: enforced client-side
+ * BEFORE the multipart upload so an oversized payload fails immediately
+ * with a clear error — instead of round-tripping a multi-MB base64 string
+ * up to the api just to get a 413 / 400 back, with the wasted bandwidth
+ * and (potentially) the multi-MB string logged by the agent host.
+ *
+ * Counted in bytes against `Buffer.byteLength(decodedTarball)`, NOT
+ * against `tarball_base64.length` (the base64 representation is ~33%
+ * larger than the decoded bytes).
+ */
+export const MAX_TARBALL_BYTES = 50 * 1024 * 1024;
+
 export interface ClientOptions {
   baseURL?: string;
 }
@@ -711,6 +725,23 @@ export class InstantClient {
 
     // Decode the base64 tarball and attach as a binary file part.
     const tarball = Buffer.from(params.tarball_base64, "base64");
+
+    // T17 P2 — enforce the 50 MiB cap CLIENT-SIDE so an oversized payload
+    // fails BEFORE we open a multipart connection and stream the bytes
+    // up to the api. Pre-fix the agent would base64-encode a giant
+    // node_modules tree, the MCP would happily POST the whole thing, and
+    // the api would 400 — wasting bandwidth and (depending on the host)
+    // logging multi-MB strings.
+    if (tarball.byteLength > MAX_TARBALL_BYTES) {
+      throw new Error(
+        `Tarball is too large: ${tarball.byteLength.toLocaleString()} bytes ` +
+          `(decoded). The api accepts at most ${MAX_TARBALL_BYTES.toLocaleString()} ` +
+          `bytes (50 MiB). Shrink the tarball: include only what \`docker build\` ` +
+          `needs — exclude node_modules, .git, build artifacts, large media files. ` +
+          `Add a .dockerignore to your project root.`
+      );
+    }
+
     const blob = new Blob([tarball], { type: "application/gzip" });
     form.append("tarball", blob, "app.tar.gz");
 
@@ -723,6 +754,26 @@ export class InstantClient {
     // arrays go through multipart as strings — the api parses them back. We
     // intentionally forward `private` even when false so the server can
     // distinguish "explicitly public" from "field omitted".
+    //
+    // T17 P2 — also enforce the api's allowed_ips ↔ private invariant
+    // client-side. The api only consults allowed_ips when private===true;
+    // passing allowed_ips without private silently drops the allowlist
+    // (the agent thinks it restricted access, but the deploy was public).
+    if (params.allowed_ips && params.allowed_ips.length > 0 && params.private !== true) {
+      throw new Error(
+        `allowed_ips was provided but \`private\` is not true. The api only ` +
+          `consults allowed_ips when private=true; passing it without private ` +
+          `would silently leave the deploy publicly reachable. Set \`private: true\` ` +
+          `to use the allowlist, OR remove allowed_ips for a public deploy.`
+      );
+    }
+    if (params.private === true && (!params.allowed_ips || params.allowed_ips.length === 0)) {
+      throw new Error(
+        `private=true requires a non-empty \`allowed_ips\` allowlist (otherwise ` +
+          `the api returns 400 private_deploy_requires_allowed_ips). Pass at ` +
+          `least one IP or CIDR, e.g. allowed_ips: ["203.0.113.42/32"].`
+      );
+    }
     if (typeof params.private === "boolean") {
       form.append("private", params.private ? "true" : "false");
     }

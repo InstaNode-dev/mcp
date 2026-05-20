@@ -196,5 +196,98 @@ assert err or 'email' in text.lower() or 'upgrade_jwt' in text.lower(), f'old cl
 " || fail "claim_token still accepts the old single-token shape (#C5)"
 pass "claim_token enforces new (upgrade_jwt, email) shape"
 
+# Test 9 — T17 P2 Wave 3: client-side 50 MiB tarball cap.
+# Construct a base64 string whose decoded payload is > 50 MiB and assert the
+# MCP client rejects it BEFORE attempting the multipart upload. The error text
+# must include the "Tarball is too large" / "50 MiB" framing AND the
+# .dockerignore hint — neither should reach the api.
+# Use python to produce 51 MiB of zeroes, base64-encode, JSON-escape.
+BIG_B64=$(python3 -c "import base64,sys; sys.stdout.write(base64.b64encode(b'\\x00' * (51*1024*1024)).decode())")
+# Send the request via tools/call. INSTANODE_TOKEN is intentionally set so we
+# bypass the "auth required" preflight and exercise the cap on the real path.
+INSTANODE_TOKEN_BAK="${INSTANODE_TOKEN:-}"
+export INSTANODE_TOKEN="inst_live_fake_for_cap_check"
+BIG_DEPLOY=$(python3 -c "
+import json, sys
+body = json.dumps({
+  'jsonrpc': '2.0', 'id': 99, 'method': 'tools/call',
+  'params': {
+    'name': 'create_deploy',
+    'arguments': {'tarball_base64': sys.stdin.read(), 'name': 'too-big'},
+  },
+})
+sys.stdout.write(body)
+" <<< "$BIG_B64")
+RESP=$(printf "%s\n%s\n" "$INIT" "$BIG_DEPLOY" | INSTANODE_API_URL="$BASE_URL" $MCP 2>/dev/null | tail -1)
+if [ -n "$INSTANODE_TOKEN_BAK" ]; then
+  export INSTANODE_TOKEN="$INSTANODE_TOKEN_BAK"
+else
+  unset INSTANODE_TOKEN
+fi
+echo "$RESP" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+text = d['result']['content'][0]['text']
+assert 'Tarball is too large' in text or 'too large' in text.lower(), f'expected oversized-tarball error, got: {text}'
+assert '50' in text and 'MiB' in text, f'error should reference the 50 MiB cap, got: {text}'
+" || fail "create_deploy did not enforce client-side 50 MiB tarball cap"
+pass "create_deploy rejects >50 MiB tarball client-side (T17 P2)"
+
+# Test 10 — T17 P2 Wave 3: allowed_ips requires private:true.
+# Pass allowed_ips WITHOUT private:true. The MCP client must reject locally
+# with a clear error so the agent doesn't think it restricted access when it
+# actually didn't.
+export INSTANODE_TOKEN="inst_live_fake_for_ips_check"
+IPS_NO_PRIVATE='{"jsonrpc":"2.0","id":100,"method":"tools/call","params":{"name":"create_deploy","arguments":{"tarball_base64":"H4sIAAAAAAAA","name":"missing-private","allowed_ips":["1.2.3.4"]}}}'
+RESP=$(printf "%s\n%s\n" "$INIT" "$IPS_NO_PRIVATE" | INSTANODE_API_URL="$BASE_URL" $MCP 2>/dev/null | tail -1)
+if [ -n "$INSTANODE_TOKEN_BAK" ]; then
+  export INSTANODE_TOKEN="$INSTANODE_TOKEN_BAK"
+else
+  unset INSTANODE_TOKEN
+fi
+echo "$RESP" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+text = d['result']['content'][0]['text']
+assert 'allowed_ips' in text, f'error must reference allowed_ips: {text}'
+assert 'private' in text, f'error must reference private flag: {text}'
+" || fail "create_deploy did not reject allowed_ips without private:true"
+pass "create_deploy rejects allowed_ips without private:true (T17 P2)"
+
+# Test 11 — T17 P2 Wave 3: private:true requires non-empty allowed_ips.
+# The api returns 400 private_deploy_requires_allowed_ips; the MCP client
+# rejects locally with a clear error before the upload.
+export INSTANODE_TOKEN="inst_live_fake_for_private_check"
+PRIVATE_NO_IPS='{"jsonrpc":"2.0","id":101,"method":"tools/call","params":{"name":"create_deploy","arguments":{"tarball_base64":"H4sIAAAAAAAA","name":"missing-ips","private":true}}}'
+RESP=$(printf "%s\n%s\n" "$INIT" "$PRIVATE_NO_IPS" | INSTANODE_API_URL="$BASE_URL" $MCP 2>/dev/null | tail -1)
+if [ -n "$INSTANODE_TOKEN_BAK" ]; then
+  export INSTANODE_TOKEN="$INSTANODE_TOKEN_BAK"
+else
+  unset INSTANODE_TOKEN
+fi
+echo "$RESP" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+text = d['result']['content'][0]['text']
+assert 'private' in text and ('allowed_ips' in text or 'allowlist' in text), \
+    f'error must mention private + allowed_ips: {text}'
+" || fail "create_deploy did not reject private:true with empty allowed_ips"
+pass "create_deploy rejects private:true with empty allowed_ips (T17 P2)"
+
+# Test 12 — T17 P2 Wave 3: delete_resource description documents the
+# anonymous-tier teardown contract (auto-expire at 24h, no on-demand delete).
+RESP=$(printf "%s\n%s\n" "$INIT" "$TOOLS_LIST" | INSTANODE_API_URL="$BASE_URL" $MCP 2>/dev/null | tail -1)
+echo "$RESP" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+tools = {t['name']: t for t in d['result']['tools']}
+desc = tools['delete_resource'].get('description', '')
+assert 'auto-expire' in desc.lower() or 'auto expire' in desc.lower(), \
+    'delete_resource description must explain anonymous auto-expire'
+assert '24h' in desc, 'delete_resource description must mention the 24h TTL'
+assert 'paid' in desc.lower(), 'delete_resource description must clarify paid-tier-only'
+" || fail "delete_resource description missing the anonymous-teardown contract"
+pass "delete_resource description documents anonymous auto-expire (T17 P2)"
+
 echo ""
 echo "All tests passed."
