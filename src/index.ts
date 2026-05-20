@@ -54,6 +54,7 @@ import {
   type ProvisionLimits,
   type Resource,
 } from "./client.js";
+import { nameSchema } from "./name_schema.js";
 
 const client = new InstantClient();
 
@@ -98,6 +99,32 @@ function formatError(err: unknown): string {
     } else if (err.status === 403 && err.code === "paid_tier_only") {
       headline =
         "Free-tier resource cannot be deleted — it will auto-expire in 24h.";
+    } else if (
+      // BugBash B16 F5 (regression of task #171): the api returns
+      //   403 forbidden  "PAT creation requires a user session, not another PAT"
+      // (api/internal/handlers/api_keys.go Create()) when a PAT (the canonical
+      // INSTANODE_TOKEN) tries to mint another PAT. The previous formatError
+      // fell through to the generic "instanode.dev error (403 forbidden)"
+      // path, leaving the agent guessing why rotation kept failing.
+      //
+      // Detect via three independent signals so a future api-side rename of
+      // either the code or the message doesn't silently regress this path:
+      //   (a) explicit code === pat_cannot_mint_pat (some envs / mocks use this)
+      //   (b) generic code === forbidden + message names PAT/session
+      //   (c) message contains the canonical sentence "PAT creation requires
+      //       a user session"
+      err.status === 403 &&
+      (err.code === "pat_cannot_mint_pat" ||
+        ((err.code === "forbidden" || !err.code) &&
+          typeof err.message === "string" &&
+          (/PAT creation requires a user session/i.test(err.message) ||
+            (/Personal Access Token/i.test(err.message) &&
+              /session/i.test(err.message)))))
+    ) {
+      headline =
+        "Cannot mint a new API key from another API key.\n\n" +
+        "The api enforces a one-step trust chain: a Personal Access Token (PAT) can only be created by a browser session JWT, not by another PAT. Your current INSTANODE_TOKEN appears to be a PAT, so this tool cannot rotate it for you.\n\n" +
+        "Fix: open https://instanode.dev/dashboard/settings (or the equivalent in your env), sign in with your email/SSO (this gives the browser a session JWT), click 'Create API Key', and paste the new key into your MCP server's INSTANODE_TOKEN env var. Then revoke the old key from the same page.";
     } else if (err.status === 429) {
       headline =
         "Rate limited (5 anonymous provisions/day per /24 subnet). " +
@@ -155,15 +182,13 @@ function appendUpgradeBlock(
   }
 }
 
-// The single-character "name" schema reused by every create_* tool.
+// The single "name" schema reused by every create_* tool. BugBash B16 F2
+// (regression of task #173): mirrors the api's ^[A-Za-z0-9][A-Za-z0-9 _-]*$
+// regex via the shared nameSchema, so bad input is rejected at the Zod
+// boundary with a precise message instead of round-tripping to the api as
+// a 400 invalid_name.
 const nameArg = {
-  name: z
-    .string()
-    .min(1)
-    .max(64)
-    .describe(
-      "Human-readable label for this resource (1–64 chars). Surfaced on the dashboard. Example: 'prospector-agent', 'stripe-sandbox'."
-    ),
+  name: nameSchema,
 };
 
 // ── Tool: create_postgres ─────────────────────────────────────────────────────
@@ -638,18 +663,31 @@ into their MCP server config as INSTANODE_TOKEN (or export it as an env var
 for CLI use).
 
 API keys are revocation-based (not time-bound) — they live until revoked
-in the dashboard. Requires an existing INSTANODE_TOKEN to bootstrap a new
-one; the typical flow is: claim once via the dashboard (browser), mint a
-key, paste it into the MCP env, then use this tool to rotate as needed.`,
+in the dashboard.
+
+IMPORTANT — PATs cannot mint other PATs (BugBash B16 F5 / task #171):
+The api enforces a one-step trust chain. A PAT (Personal Access Token, the
+standard INSTANODE_TOKEN format) can only be created by a logged-in user
+session, NOT by another PAT. So this tool will return HTTP 403 "PAT creation
+requires a user session" whenever INSTANODE_TOKEN itself is a PAT (which is
+the common case once the user has minted at least one).
+
+The supported flow is therefore:
+  1. Claim once via the dashboard's browser sign-in.
+  2. From the dashboard's Settings → API Keys page, mint the FIRST key.
+  3. Paste it into the MCP server's INSTANODE_TOKEN.
+  4. Rotate by minting a NEW key in the dashboard (not via this tool) and
+     revoking the old one.
+
+This tool remains useful for the (rare) caller running with a dashboard
+session token (not a PAT), and as a clear surface for the 403 above so the
+agent can route the user to the dashboard instead of guessing.`,
   {
-    name: z
-      .string()
-      .min(1)
-      .max(120)
-      .optional()
-      .describe(
-        "Optional human-readable label so you can identify this key in the dashboard. Defaults to 'instanode-mcp'."
-      ),
+    // BugBash B16 F2 (regression of task #173): mirror the api's name regex
+    // here too — the api applies the same /^[A-Za-z0-9][A-Za-z0-9 _-]*$/ on
+    // POST /api/v1/auth/api-keys. Optional because this tool defaults the
+    // label to "instanode-mcp" when omitted.
+    name: nameSchema.optional(),
   },
   async ({ name }) => {
     try {
@@ -725,13 +763,9 @@ Requires INSTANODE_TOKEN (anonymous tier cannot deploy).`,
       .describe(
         "Base64-encoded gzip tarball of the project directory (must include a Dockerfile at the root). <50 MB after decode."
       ),
-    name: z
-      .string()
-      .min(1)
-      .max(64)
-      .describe(
-        "Human-readable name for this resource, 1-64 chars, letters/numbers/spaces/dashes — shown in the dashboard. Required."
-      ),
+    // BugBash B16 F2 (regression of task #173): same name regex as every other
+    // create_* tool — mirrors the api's contract via nameSchema.
+    name: nameSchema,
     port: z
       .number()
       .int()
@@ -818,6 +852,10 @@ Requires INSTANODE_TOKEN.`,
   async () => {
     try {
       const result = await client.listDeployments();
+      // BugBash B16 F1 (regression of task #170): defensive — if the api ever
+      // hands back an empty 2xx body, the empty-body sentinel coerces it to
+      // {ok: true} with no `items` field. Treat that the same as no
+      // deployments rather than dereferencing undefined.
       if (!result.items || result.items.length === 0) {
         return textResult(
           "No deployments on this team yet.\n\nUse create_deploy to ship one — pass a base64 gzip tarball of your project (must include a Dockerfile)."
@@ -868,13 +906,21 @@ Requires INSTANODE_TOKEN.`,
   async ({ id }) => {
     try {
       const result = await client.getDeployment(id);
+      // BugBash B16 F1 (regression of task #170): if the api ever returns an
+      // empty 2xx, the sentinel coerces to {ok: true} with no `item` field.
+      // Surface that explicitly rather than crashing on `result.item.app_id`.
       const d = result.item;
+      if (!d) {
+        return textResult(
+          `Deployment ${id}: server returned 2xx with no body. Re-poll get_deployment to fetch the current state.`
+        );
+      }
       const lines = [
-        `Deployment ${d.app_id}`,
-        `Status:      ${d.status}`,
+        `Deployment ${d.app_id ?? id}`,
+        `Status:      ${d.status ?? "(unknown)"}`,
         `URL:         ${d.url || "(pending)"}`,
-        `Tier:        ${d.tier}`,
-        `Port:        ${d.port}`,
+        `Tier:        ${d.tier ?? "(unknown)"}`,
+        `Port:        ${d.port ?? "(unknown)"}`,
       ];
       if (d.environment) lines.push(`Environment: ${d.environment}`);
       if (d.private) {
@@ -923,14 +969,20 @@ Requires INSTANODE_TOKEN.`,
   },
   async ({ id }) => {
     try {
+      // BugBash B16 F1 (regression of task #170): /deploy/:id/redeploy returns
+      // a bare 202 with no body — the previous handler dereferenced
+      // result.item.app_id and crashed with "Cannot read properties of
+      // undefined (reading 'app_id')". client.redeploy() now resolves to
+      // {ok, id, status, message} with safe fallbacks so the handler stays
+      // alive even when the body is empty.
       const result = await client.redeploy(id);
-      const d = result.item;
+      const appId = result.id ?? id;
       const lines = [
-        `Redeploy accepted for ${d.app_id}.`,
-        `Status: ${d.status}`,
+        `Redeploy accepted for ${appId}.`,
+        `Status: ${result.status ?? "building"}`,
       ];
-      if (d.url) lines.push(`URL:    ${d.url}`);
-      lines.push(``, `Poll get_deployment({ id: "${d.app_id}" }) until status="running".`);
+      if (result.message) lines.push(`Message: ${result.message}`);
+      lines.push(``, `Poll get_deployment({ id: "${appId}" }) until status="running".`);
       return textResult(lines.join("\n"));
     } catch (err) {
       return textResult(formatError(err));
