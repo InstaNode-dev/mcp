@@ -54,6 +54,7 @@ const SERVER_ENTRY = resolve(__dirname, "..", "..", "dist", "index.js");
 /** Every tool the server is contractually required to register. */
 const EXPECTED_TOOLS = [
   "create_postgres",
+  "create_vector",
   "create_cache",
   "create_nosql",
   "create_queue",
@@ -200,7 +201,7 @@ describe("instanode-mcp integration suite", () => {
   // ── Tool registry + schemas ─────────────────────────────────────────────────
 
   describe("tool registry", () => {
-    it("registers exactly the 16 contract tools, no dead ones", async () => {
+    it("registers exactly the 17 contract tools, no dead ones", async () => {
       const { client, close } = await connectClient(mock.url, "none");
       try {
         const { tools } = await client.listTools();

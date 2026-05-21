@@ -331,6 +331,7 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
   // ── create_* provisioning routes ──────────────────────────────────────────
   const provisionRoutes: Record<string, string> = {
     "/db/new": "postgres",
+    "/vector/new": "postgres",
     "/cache/new": "cache",
     "/nosql/new": "nosql",
     "/queue/new": "queue",
