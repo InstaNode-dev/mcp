@@ -59,8 +59,26 @@ import { nameSchema } from "./name_schema.js";
 
 const client = new InstantClient();
 
-const pkgPath = resolve(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
-const pkgVersion = JSON.parse(readFileSync(pkgPath, "utf8")).version as string;
+/**
+ * Resolve the package.json version once at module-init. Falls back to "dev"
+ * if the file isn't where we expect — same defensive pattern as the
+ * User-Agent resolver in client.ts, so unit tests that import this module
+ * from a non-canonical build path (e.g. `dist-test/src/index.js`, two dirs
+ * removed from the package.json instead of one) don't crash before any
+ * test code runs. The production binary path (`dist/index.js`) is one
+ * level under the repo root, so the resolve always finds the file.
+ */
+function resolvePkgVersion(): string {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const pkgPath = resolve(here, "..", "package.json");
+    return (JSON.parse(readFileSync(pkgPath, "utf8")).version as string) ?? "dev";
+  } catch {
+    return "dev";
+  }
+}
+
+const pkgVersion = resolvePkgVersion();
 
 const server = new McpServer({
   name: "instanode.dev",
@@ -85,7 +103,7 @@ const server = new McpServer({
  *   Upgrade: {upgrade_url, when present}
  *   Claim:   {claim_url, when present}
  */
-function formatError(err: unknown): string {
+export function formatError(err: unknown): string {
   if (err instanceof AuthRequiredError) {
     return err.message;
   }
@@ -152,11 +170,11 @@ function formatError(err: unknown): string {
   return `instanode.dev error: ${msg}`;
 }
 
-function textResult(text: string) {
+export function textResult(text: string) {
   return { content: [{ type: "text" as const, text }] };
 }
 
-function formatLimits(limits: ProvisionLimits | undefined): string[] {
+export function formatLimits(limits: ProvisionLimits | undefined): string[] {
   const lines: string[] = [];
   if (!limits) return lines;
   if (typeof limits.storage_mb === "number") lines.push(`Storage: ${limits.storage_mb} MB`);
@@ -172,7 +190,7 @@ function formatLimits(limits: ProvisionLimits | undefined): string[] {
  * so the end user sees the exact CTA + claim URL. Structurally typed so
  * it accepts both ProvisionResultBase and DeployResult.
  */
-function appendUpgradeBlock(
+export function appendUpgradeBlock(
   lines: string[],
   result: { note?: string; upgrade?: string }
 ): void {
@@ -1136,5 +1154,17 @@ Requires INSTANODE_TOKEN.`,
 
 // ── Start server ──────────────────────────────────────────────────────────────
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+// Unit tests import this module purely to reach the exported helpers
+// (formatError / formatLimits / appendUpgradeBlock) without binding to a real
+// stdio transport — set INSTANODE_MCP_NO_LISTEN=1 in that case. The CLI binary
+// path (and integration tests that spawn `node dist/index.js`) never set this
+// var, so the production behavior is unchanged.
+if (!process.env["INSTANODE_MCP_NO_LISTEN"]) {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}
+
+// Re-export the MCP server so unit tests can introspect the tool registry
+// without spawning a subprocess. Production callers ignore this — the binary
+// entrypoint only depends on the `await server.connect(...)` above.
+export { server };
