@@ -31,8 +31,38 @@
  * client to the canonical routes above.
  */
 
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
 const DEFAULT_BASE_URL = "https://api.instanode.dev";
 const DEFAULT_DASHBOARD_URL = "https://instanode.dev";
+
+/**
+ * Module-init User-Agent — resolved once from package.json so every release
+ * naturally rolls forward without anyone remembering to bump a hardcoded
+ * string. BugBash B16 F4 (regression of task #176): the previous version
+ * carried `instanode-mcp/0.11.0` as a literal in two places, which drifted
+ * out of sync with the published package version. Falling back to "dev" on
+ * any failure (file missing, malformed JSON) so the client never explodes
+ * at import time just to read a UA.
+ */
+function resolveUserAgent(): string {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    // dist/client.js → repo root; src/client.ts → repo root in dev. Same path.
+    const pkgPath = resolve(here, "..", "package.json");
+    const pkgRaw = readFileSync(pkgPath, "utf8");
+    const pkg = JSON.parse(pkgRaw) as { name?: string; version?: string };
+    const name = pkg.name && pkg.name.length > 0 ? pkg.name : "instanode-mcp";
+    const version = pkg.version && pkg.version.length > 0 ? pkg.version : "dev";
+    return `${name}/${version}`;
+  } catch {
+    return "instanode-mcp/dev";
+  }
+}
+
+const USER_AGENT = resolveUserAgent();
 
 export interface ClientOptions {
   baseURL?: string;
@@ -200,6 +230,23 @@ export interface DeployDeleteResult {
   message?: string;
 }
 
+/**
+ * Response shape from POST /deploy/:id/redeploy.
+ *
+ * The live API documents this as a bare 202 with NO body (see openapi.json),
+ * not a deployment record. The previous client mis-typed it as DeployGetResult
+ * and the index.ts handler dereferenced `result.item.app_id`, blowing up
+ * with "Cannot read properties of undefined (reading 'app_id')" on every
+ * real call. BugBash B16 F1 (regression of task #170): use a body-less type
+ * and let callers fall back to the caller-supplied id when needed.
+ */
+export interface RedeployResult {
+  ok: boolean;
+  id?: string;
+  status?: string;
+  message?: string;
+}
+
 /** Caller-supplied params for create_deploy. */
 export interface CreateDeployParams {
   /** Base64-encoded gzip tarball (with Dockerfile + source). <50 MB after decode. */
@@ -360,7 +407,7 @@ export class InstantClient {
   private headers(): Record<string, string> {
     const h: Record<string, string> = {
       "Content-Type": "application/json",
-      "User-Agent": "instanode-mcp/0.11.0",
+      "User-Agent": USER_AGENT,
     };
     const tok = this.bearerToken();
     if (tok) {
@@ -375,7 +422,7 @@ export class InstantClient {
    */
   private authHeaders(): Record<string, string> {
     const h: Record<string, string> = {
-      "User-Agent": "instanode-mcp/0.11.0",
+      "User-Agent": USER_AGENT,
     };
     const tok = this.bearerToken();
     if (tok) {
@@ -444,6 +491,19 @@ export class InstantClient {
       );
     }
 
+    // BugBash B16 F1 (regression of task #170 P0-1): empty 2xx bodies used to
+    // leave `data` as undefined, and any caller that did `result.foo` blew up
+    // with "Cannot read properties of undefined (reading 'foo')". Eight tools
+    // hit this: redeploy, delete_resource, delete_deployment, get_deployment,
+    // list_deployments, list_resources, get_api_token, claim_token — most
+    // commonly redeploy + delete_*, which the API documents as bare 2xx (no
+    // body). The previous fix only patched redeploy. Now: any 2xx with an
+    // empty body returns a safe sentinel `{ok: true}` so the dereferencing
+    // path stays alive. Callers that need richer fields handle the empty
+    // case explicitly (see redeploy / deleteResource / deleteDeployment).
+    if (data === undefined) {
+      return { ok: true } as T;
+    }
     return data as T;
   }
 
@@ -510,6 +570,13 @@ export class InstantClient {
       );
     }
 
+    // Same empty-2xx safe sentinel as request<T>(). See the long comment up
+    // there for the why. requestMultipart() is only used for create_deploy
+    // today, which always returns a JSON body, but mirroring the safety
+    // makes the two paths drift-free.
+    if (data === undefined) {
+      return { ok: true } as T;
+    }
     return data as T;
   }
 
@@ -715,14 +782,31 @@ export class InstantClient {
     );
   }
 
-  /** POST /deploy/:id/redeploy — rebuild + rolling update an existing app. */
-  async redeploy(id: string): Promise<DeployGetResult> {
-    return this.request<DeployGetResult>(
+  /**
+   * POST /deploy/:id/redeploy — rebuild + rolling update an existing app.
+   *
+   * The live API returns a bare 202 with no body (see openapi.json). Earlier
+   * versions of this client typed the response as DeployGetResult and the
+   * tool handler dereferenced `result.item.app_id`, throwing
+   * "Cannot read properties of undefined (reading 'app_id')" on every real
+   * call. BugBash B16 F1 (regression of task #170): the empty-body now
+   * resolves to `{ok: true}` via the request<T>() empty-2xx sentinel; this
+   * helper layers the caller-supplied id on top so the tool handler has a
+   * stable surface to read.
+   */
+  async redeploy(id: string): Promise<RedeployResult> {
+    const raw = await this.request<RedeployResult>(
       "POST",
       `/deploy/${encodeURIComponent(id)}/redeploy`,
       undefined,
       { requireAuth: true }
     );
+    return {
+      ok: raw.ok ?? true,
+      id: raw.id ?? id,
+      status: raw.status ?? "building",
+      message: raw.message,
+    };
   }
 
   /** DELETE /deploy/:id — tear down the running pod + remove the record. */
