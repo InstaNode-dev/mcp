@@ -1,9 +1,14 @@
 name: Publish to npm
 
+# Auto-trigger disabled — the `instanode-mcp` package isn't claimed on
+# npmjs.org so every `npm publish` fails with 404 PUT. Parked per
+# operator decision. Once the npm package is claimed (npm owner add
+# from authorised account, or first manual publish), restore the
+# push trigger by uncommenting the lines below.
 on:
-  push:
-    branches: [master]
-    paths: [package.json]
+  # push:
+  #   branches: [master]
+  #   paths: [package.json]
   workflow_dispatch: {}
 
 permissions:
