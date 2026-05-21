@@ -5,6 +5,7 @@
  * Exposes tools to AI coding agents (Claude Code, Cursor, Windsurf, etc.):
  *
  *   create_postgres    — provision an ephemeral Postgres database (with pgvector)
+ *   create_vector      — provision a pgvector-enabled Postgres database (embedding store)
  *   create_cache       — provision a Redis cache (ACL-scoped user + namespace)
  *   create_nosql       — provision a MongoDB database (per-resource user + role)
  *   create_queue       — provision a NATS JetStream queue (publish/subscribe)
@@ -230,6 +231,75 @@ Store the connection_url in an env var (DATABASE_URL); do not hardcode it.`,
         `  DATABASE_URL=${result.connection_url}`,
         ``,
         `pgvector is ready — no CREATE EXTENSION needed.`
+      );
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
+    }
+  }
+);
+
+// ── Tool: create_vector ───────────────────────────────────────────────────────
+
+server.tool(
+  "create_vector",
+  `Provision a pgvector-enabled Postgres database on instanode.dev (POST /vector/new).
+
+Underlying storage IS Postgres (tier limits mirror Postgres exactly), with the
+pgvector extension already loaded via CREATE EXTENSION vector at provisioning
+time. Use for embedding stores (OpenAI text-embedding-ada-002 / 3-small = 1536
+dims; text-embedding-3-large = 3072). Returns a standard postgres:// connection
+URL — drop in as DATABASE_URL with any pg driver.
+
+Note: create_postgres ALSO ships with pgvector pre-installed today, so this
+tool is functionally equivalent for embedding workloads. Use create_vector when
+the agent wants to make the intent (pgvector / embeddings) explicit, or when
+the API contract evolves and pgvector-only routing diverges from generic
+Postgres provisioning.
+
+The optional 'dimensions' field is a documentation hint only — pgvector lets
+you pick per-column dimensions at table-create time, so the server stores the
+declared default but does not enforce it.
+
+Without INSTANODE_TOKEN: anonymous tier — 10 MB, 2 connections, expires in 24h,
+capped at 5 provisions/day per /24 subnet. The response carries 'note' +
+'upgrade' (claim URL) — surface both verbatim.
+With INSTANODE_TOKEN (paid): hobby/pro/team Postgres limits, permanent.
+
+The 'name' field is required.`,
+  {
+    ...nameArg,
+    dimensions: z
+      .number()
+      .int()
+      .min(1)
+      .max(16000)
+      .optional()
+      .describe(
+        "Optional embedding dimension hint (defaults to 1536 — OpenAI text-embedding-3-small / ada-002). Use 3072 for text-embedding-3-large. Informational only; pgvector enforces dimensions per column at table-create time."
+      ),
+  },
+  async ({ name, dimensions }) => {
+    try {
+      const result = await client.createVector(name, dimensions);
+      const lines = [
+        `pgvector Postgres database provisioned.`,
+        `Token:          ${result.token}`,
+        `Name:           ${result.name ?? name}`,
+        `Tier:           ${result.tier}`,
+        `Connection URL: ${result.connection_url}`,
+        `Extension:      ${result.extension ?? "pgvector"}`,
+        `Dimensions:     ${result.dimensions ?? dimensions ?? 1536}`,
+        ...formatLimits(result.limits),
+      ];
+      appendUpgradeBlock(lines, result);
+      lines.push(
+        ``,
+        `Use directly as DATABASE_URL (add .env to .gitignore):`,
+        `  DATABASE_URL=${result.connection_url}`,
+        ``,
+        `pgvector is ready — no CREATE EXTENSION needed. Pick column dimensions`,
+        `at CREATE TABLE time, e.g. embedding vector(1536).`
       );
       return textResult(lines.join("\n"));
     } catch (err) {

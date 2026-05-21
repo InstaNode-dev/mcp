@@ -128,6 +128,18 @@ export interface DatabaseProvisionResult extends ProvisionResultBase {
   connection_url: string;
 }
 
+export interface VectorProvisionResult extends ProvisionResultBase {
+  /**
+   * postgres:// connection string with the pgvector extension pre-installed
+   * (CREATE EXTENSION vector already ran). Drop-in DATABASE_URL.
+   */
+  connection_url: string;
+  /** Always 'pgvector'. */
+  extension?: string;
+  /** Echo of the requested default embedding dimensions hint (defaults to 1536). */
+  dimensions?: number;
+}
+
 export interface CacheProvisionResult extends ProvisionResultBase {
   /** redis://user:pass@host:port — drop-in REDIS_URL. */
   connection_url: string;
@@ -597,6 +609,22 @@ export class InstantClient {
   /** POST /db/new — provision a Postgres database. `name` is required. */
   async createPostgres(name: string): Promise<DatabaseProvisionResult> {
     return this.request<DatabaseProvisionResult>("POST", "/db/new", { name });
+  }
+
+  /**
+   * POST /vector/new — provision a pgvector-enabled Postgres database. `name`
+   * is required client-side for parity with the other create_* tools (the
+   * server allows it to be omitted, but every other endpoint requires it).
+   * Optional `dimensions` is a documentation hint only — pgvector picks
+   * dimensions per column at table-create time.
+   */
+  async createVector(
+    name: string,
+    dimensions?: number
+  ): Promise<VectorProvisionResult> {
+    const body: { name: string; dimensions?: number } = { name };
+    if (typeof dimensions === "number") body.dimensions = dimensions;
+    return this.request<VectorProvisionResult>("POST", "/vector/new", body);
   }
 
   /** POST /cache/new — provision a Redis cache. `name` is required. */

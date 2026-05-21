@@ -107,6 +107,7 @@ to reach for this MCP, see <https://instanode.dev/agent.html>.
 | Tool              | Description                                                                                                                                                       |
 |-------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `create_postgres` | `POST /db/new` — Provision a Postgres database (pgvector included). Returns `connection_url` + the `note`/`upgrade` claim URL. `name` required.                   |
+| `create_vector`   | `POST /vector/new` — Provision a pgvector-enabled Postgres database (embedding store). Returns `connection_url` + `extension`/`dimensions` + `note`/`upgrade`. `name` required; optional `dimensions` is a documentation hint. |
 | `create_cache`    | `POST /cache/new` — Provision a Redis cache (ACL-scoped user + namespace). Returns `connection_url` + `note`/`upgrade`. `name` required.                          |
 | `create_nosql`    | `POST /nosql/new` — Provision a MongoDB database (per-resource user + DB-scoped role). Returns `connection_url` + `note`/`upgrade`. `name` required.              |
 | `create_queue`    | `POST /queue/new` — Provision a NATS JetStream queue (scoped subject namespace). Returns `connection_url` + `note`/`upgrade`. `name` required.                    |
@@ -118,10 +119,10 @@ to reach for this MCP, see <https://instanode.dev/agent.html>.
 | `redeploy`        | `POST /deploy/:id/redeploy` — Rebuild + rolling update an existing deployment. Requires `INSTANODE_TOKEN`.                                                        |
 | `delete_deployment` | `DELETE /deploy/:id` — Tear down a running deployment. Irreversible. Requires `INSTANODE_TOKEN`.                                                                |
 | `claim_resource`  | Helper — turn an `upgrade_jwt` from any `create_*` response into the dashboard claim URL the user should click. No API call. No auth required.                    |
-| `claim_token`     | `POST /api/me/claim` — Programmatic claim: attach an anonymous resource to the authenticated account by its UUID `token`. Requires `INSTANODE_TOKEN`.             |
-| `list_resources`  | `GET /api/me/resources` — List resources on the caller's account. Requires `INSTANODE_TOKEN`.                                                                     |
-| `delete_resource` | `DELETE /api/me/resources/{token}` — Hard-delete a resource you own. Paid tier only. Requires `INSTANODE_TOKEN`.                                                  |
-| `get_api_token`   | `GET /api/me/token` — Mint a fresh 30-day bearer JWT (for rotation). Requires an existing `INSTANODE_TOKEN`.                                                      |
+| `claim_token`     | `POST /claim` — Programmatic claim: attach an anonymous resource to the authenticated account using its `upgrade_jwt` + `email`. No auth required.                |
+| `list_resources`  | `GET /api/v1/resources` — List resources on the caller's account. Requires `INSTANODE_TOKEN`.                                                                     |
+| `delete_resource` | `DELETE /api/v1/resources/{token}` — Hard-delete a resource you own. Paid tier only. Requires `INSTANODE_TOKEN`.                                                  |
+| `get_api_token`   | `POST /api/v1/auth/api-keys` — Mint a fresh bearer Personal Access Token (PAT). Requires an existing user-session `INSTANODE_TOKEN` (PATs cannot mint other PATs — the API returns 403 in that case). |
 
 ### Container deployment (`create_deploy`)
 
@@ -290,7 +291,7 @@ resources, and the account-management tools (`list_resources`,
 3. Set it as `INSTANODE_TOKEN` in the MCP server's `env` block (see examples
    above).
 
-Rotate any time by calling `get_api_token`, which mints a fresh 30-day JWT.
+Rotate any time by calling `get_api_token`, which mints a fresh Personal Access Token via `POST /api/v1/auth/api-keys`. PATs are revocation-based (not time-bound). NOTE: PATs cannot mint other PATs — `get_api_token` requires a user-session token (sign in via the dashboard), not an existing PAT, otherwise the API returns 403.
 
 ## Development
 
