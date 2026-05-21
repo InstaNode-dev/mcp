@@ -206,6 +206,10 @@ capped at 5 provisions/day per /24 subnet. The response includes a 'note' and
 'upgrade' (claim) URL; surface both to the user so they know how to keep it.
 With INSTANODE_TOKEN (paid): hobby/pro/team limits per the user's plan, permanent.
 
+Cleanup: anonymous tier auto-expires after 24h — there is no on-demand
+delete_resource for anonymous tokens, by design. On a paid tier, call
+delete_resource to tear down on demand.
+
 Store the connection_url in an env var (DATABASE_URL); do not hardcode it.`,
   nameArg,
   async ({ name }) => {
@@ -248,6 +252,10 @@ Without INSTANODE_TOKEN: anonymous tier — 5 MB, 24h TTL. The response carries
 'note' + 'upgrade' (claim URL) — surface both verbatim.
 With INSTANODE_TOKEN (paid): hobby 25 MB / pro 256 MB / team unlimited, permanent.
 
+Cleanup: anonymous resources auto-expire after 24h — there is no on-demand
+delete for anonymous tokens, by design. On a paid tier, call
+delete_resource to tear down on demand.
+
 The 'name' field is required.`,
   nameArg,
   async ({ name }) => {
@@ -288,6 +296,10 @@ Without INSTANODE_TOKEN: anonymous tier — 5 MB, 2 connections, 24h TTL.
 'note' + 'upgrade' fields in the response surface the claim URL.
 With INSTANODE_TOKEN (paid): hobby 100 MB / pro 2 GB / team unlimited, permanent.
 
+Cleanup: anonymous resources auto-expire after 24h — there is no on-demand
+delete for anonymous tokens, by design. On a paid tier, call
+delete_resource to tear down on demand.
+
 The 'name' field is required.`,
   nameArg,
   async ({ name }) => {
@@ -327,6 +339,10 @@ nats.py client.
 
 Without INSTANODE_TOKEN: anonymous tier — 24h TTL, basic message quotas.
 With INSTANODE_TOKEN (paid): tier-scaled quotas, permanent.
+
+Cleanup: anonymous resources auto-expire after 24h — there is no on-demand
+delete for anonymous tokens, by design. On a paid tier, call
+delete_resource to tear down on demand.
 
 The 'name' field is required.`,
   nameArg,
@@ -375,6 +391,11 @@ lifecycle policy (objects auto-delete). Response carries 'note' + 'upgrade'
 (claim URL) — surface both verbatim so the user can keep their objects past 24h.
 With INSTANODE_TOKEN (paid): tier-scaled storage limits, permanent.
 
+Cleanup: anonymous storage prefixes auto-expire after 24h — there is no
+on-demand delete for anonymous tokens, by design. Objects under the
+prefix are removed by the bucket lifecycle policy. On a paid tier, call
+delete_resource to tear down on demand.
+
 The 'name' field is required.`,
   nameArg,
   async ({ name }) => {
@@ -422,7 +443,11 @@ during development, building integrations without exposing a local port.
 
 Without INSTANODE_TOKEN: anonymous tier — up to 100 requests stored, 24h TTL.
 'note' + 'upgrade' fields in the response carry the claim URL — surface both.
-With INSTANODE_TOKEN (paid): 1000+ stored per tier, permanent.`,
+With INSTANODE_TOKEN (paid): 1000+ stored per tier, permanent.
+
+Cleanup: anonymous webhook receivers auto-expire after 24h — there is no
+on-demand delete for anonymous tokens, by design. On a paid tier, call
+delete_resource to tear down on demand.`,
   nameArg,
   async ({ name }) => {
     try {
@@ -627,8 +652,17 @@ token). Drops the underlying Postgres/Mongo database, Redis ACL user, NATS
 user, storage prefix, or clears the webhook's request log, then marks the
 row status='deleted'.
 
-Paid tier only. Free-tier and anonymous resources auto-expire in 24h and
-cannot be deleted manually — the tool will surface the upgrade URL.
+Paid tier only (hobby/pro/team). Anonymous and free tiers cannot be
+deleted manually BY DESIGN — they auto-expire 24h after creation. This is
+the documented platform contract (see CLAUDE.md "anonymous = 24h TTL"):
+the free surface is throwaway-by-construction, which is why there's no
+auth required to provision and why deletion is a paid-tier feature. If
+your agent needs on-demand teardown, claim the resources first (move
+them to a paid tier), then call delete_resource.
+
+For anonymous-tier cleanup: do nothing — the resource self-destructs at
+the 24h mark. The api's worker reaper handles the underlying DB / Redis
+ACL / storage prefix cleanup automatically.
 
 Requires INSTANODE_TOKEN.`,
   {
@@ -751,9 +785,17 @@ vault is per-team, per-env; rotate without redeploying). 'env_vars' and
 
 The 'name' field is required (the human-readable label shown on the dashboard).
 
-Private deploys: set 'private: true' and pass 'allowed_ips' (IPs or CIDR
+Private deploys: set 'private: true' AND pass 'allowed_ips' (IPs or CIDR
 blocks) to restrict access at the Ingress. Pro tier or higher is required —
 hobby tier returns 402 with an agent_action prompting the user to upgrade.
+The two fields are coupled (T17 P2): allowed_ips without private:true is
+silently dropped by the api (the deploy stays publicly reachable), and
+private:true with an empty allowed_ips is a 400. The MCP client rejects
+both shapes locally with a clear error before the upload.
+
+Tarball cap: 50 MiB after base64 decode. The MCP client enforces this
+client-side (T17 P2) — an oversized payload fails fast with a "shrink the
+tarball" hint instead of being uploaded and rejected server-side.
 
 Requires INSTANODE_TOKEN (anonymous tier cannot deploy).`,
   {
