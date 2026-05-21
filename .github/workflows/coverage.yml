@@ -20,7 +20,8 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
-      - run: npm test -- --coverage || true
+      - run: npm test -- --coverage
       - uses: codecov/codecov-action@v4
+        if: always()
         with:
           fail_ci_if_error: false
