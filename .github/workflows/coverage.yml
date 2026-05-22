@@ -17,7 +17,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # >=22 for --test-coverage-exclude support (added 22.5.0).
+          node-version: 22
           cache: npm
       - run: npm ci
       - run: npm test -- --coverage
