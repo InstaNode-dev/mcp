@@ -1,0 +1,74 @@
+name: coverage
+
+on:
+  pull_request:
+    branches: [master, main]
+  push:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Full history so diff-cover can resolve origin/<base_ref>.
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          # >=22 for --test-coverage-exclude support (added 22.5.0).
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test -- --coverage
+      - uses: codecov/codecov-action@v6
+        if: always()
+        with:
+          fail_ci_if_error: false
+
+      # ------------------------------------------------------------------
+      # Org patch-coverage mandate: every changed line in a PR diff must be
+      # covered by a test (100%). Tool: diff-cover
+      # (https://github.com/Bachmann1234/diff-cover).
+      #
+      # The node test runner reports coverage on the COMPILED JS in dist-test/.
+      # `--enable-source-maps` makes the built-in lcov reporter rewrite both
+      # the file paths and the line numbers back to the original TypeScript
+      # sources (src/*.ts) via the emitted .js.map files, so diff-cover lines
+      # up with the PR diff. Without it, lcov emits dist-test/src/*.js with
+      # JS line numbers and the gate silently no-ops.
+      # ------------------------------------------------------------------
+      - name: Generate lcov mapped to TS sources
+        if: github.event_name == 'pull_request'
+        run: |
+          npm run pretest
+          mkdir -p coverage
+          node --enable-source-maps --test --experimental-test-coverage \
+            --test-coverage-exclude='dist-test/test/**' \
+            --test-coverage-exclude='dist/**' \
+            --test-coverage-exclude='node_modules/**' \
+            --test-reporter=lcov --test-reporter-destination=coverage/lcov.info \
+            --test-reporter=spec --test-reporter-destination=stdout \
+            dist-test/test/integration.test.js \
+            dist-test/test/live-smoke.test.js \
+            dist-test/test/client-unit.test.js \
+            dist-test/test/index-unit.test.js \
+            dist-test/test/tools-unit.test.js
+      - uses: actions/setup-python@v6
+        if: github.event_name == 'pull_request'
+        with:
+          python-version: '3.12'
+      - name: Install diff-cover
+        if: github.event_name == 'pull_request'
+        run: pip install diff-cover
+      - name: Patch coverage gate (100% of changed lines)
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin "${{ github.base_ref }}" --depth=1 || true
+          diff-cover coverage/lcov.info \
+            --compare-branch="origin/${{ github.base_ref }}" \
+            --fail-under=100

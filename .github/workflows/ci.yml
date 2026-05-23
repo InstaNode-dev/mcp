@@ -10,11 +10,14 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: '20'
+          # >=22 required: the `test` script uses --test-coverage-exclude,
+          # which Node added in 22.5.0. On Node 20 it errors with
+          # `bad option: --test-coverage-exclude` and the build job hard-fails.
+          node-version: '22'
 
       - run: npm ci
       - run: npm run build
