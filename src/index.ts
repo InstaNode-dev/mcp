@@ -1562,16 +1562,21 @@ export function maybeShortCircuit(
   return false;
 }
 
+// BUG-MCP-017: CLI flag short-circuit runs OUTSIDE the no-listen guard so the
+// real binary (which never sets INSTANODE_MCP_NO_LISTEN) can be probed for
+// --version / --help without sitting on stdin. The exported helper makes
+// both the short-circuit-true and fall-through-false branches reachable
+// from unit tests via an injected exit fn — see input-hardening-unit.test.ts.
+maybeShortCircuit(process.argv.slice(2));
+
 // Unit tests import this module purely to reach the exported helpers
 // (formatError / formatLimits / appendUpgradeBlock) without binding to a real
 // stdio transport — set INSTANODE_MCP_NO_LISTEN=1 in that case. The CLI binary
 // path (and integration tests that spawn `node dist/index.js`) never set this
 // var, so the production behavior is unchanged.
 if (!process.env["INSTANODE_MCP_NO_LISTEN"]) {
-  if (!maybeShortCircuit(process.argv.slice(2))) {
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-  }
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
 }
 
 // Re-export the MCP server so unit tests can introspect the tool registry
