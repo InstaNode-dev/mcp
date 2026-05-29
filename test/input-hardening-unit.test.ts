@@ -34,12 +34,14 @@ let server: any;
 let handleCLIFlags: (argv: readonly string[]) => boolean;
 let isIPOrCIDR: (s: string) => boolean;
 let validateBaseURL: (raw: string) => string | null;
+let maybeShortCircuit: (argv: readonly string[], exit?: (n: number) => void) => boolean;
 
 before(async () => {
   const indexMod: any = await import("../src/index.js");
   server = indexMod.server;
   handleCLIFlags = indexMod.handleCLIFlags;
   isIPOrCIDR = indexMod.isIPOrCIDR;
+  maybeShortCircuit = indexMod.maybeShortCircuit;
   const clientMod: any = await import("../src/client.js");
   validateBaseURL = clientMod.validateBaseURL;
 });
@@ -77,6 +79,31 @@ describe("BUG-MCP-017: real-binary short-circuit", () => {
     assert.equal(r.status, 0, `non-zero exit: stderr=${r.stderr}`);
     assert.match(r.stdout, /instanode-mcp/);
     assert.match(r.stdout, /Usage:/);
+  });
+});
+
+describe("BUG-MCP-017: maybeShortCircuit branches", () => {
+  it("returns true and calls exit(0) on --version", () => {
+    const origWrite = process.stdout.write.bind(process.stdout);
+    (process.stdout as any).write = () => true;
+    let exitCode: number | undefined;
+    try {
+      const out = maybeShortCircuit(["--version"], (n) => {
+        exitCode = n;
+      });
+      assert.equal(out, true);
+      assert.equal(exitCode, 0);
+    } finally {
+      (process.stdout as any).write = origWrite;
+    }
+  });
+  it("returns false and does not call exit on empty argv", () => {
+    let called = false;
+    const out = maybeShortCircuit([], () => {
+      called = true;
+    });
+    assert.equal(out, false);
+    assert.equal(called, false);
   });
 });
 

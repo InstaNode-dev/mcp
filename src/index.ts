@@ -1547,17 +1547,31 @@ export function handleCLIFlags(argv: readonly string[]): boolean {
 
 // ── Start server ──────────────────────────────────────────────────────────────
 
+// maybeShortCircuit invokes handleCLIFlags(argv); if a CLI flag was handled,
+// calls exit() to terminate the process. Returns true when it short-circuited,
+// false otherwise. Extracted so unit tests can drive both branches without
+// touching process.argv or actually exiting the test runner.
+export function maybeShortCircuit(
+  argv: readonly string[],
+  exit: (code: number) => void = process.exit
+): boolean {
+  if (handleCLIFlags(argv)) {
+    exit(0);
+    return true;
+  }
+  return false;
+}
+
 // Unit tests import this module purely to reach the exported helpers
 // (formatError / formatLimits / appendUpgradeBlock) without binding to a real
 // stdio transport — set INSTANODE_MCP_NO_LISTEN=1 in that case. The CLI binary
 // path (and integration tests that spawn `node dist/index.js`) never set this
 // var, so the production behavior is unchanged.
 if (!process.env["INSTANODE_MCP_NO_LISTEN"]) {
-  if (handleCLIFlags(process.argv.slice(2))) {
-    process.exit(0);
+  if (!maybeShortCircuit(process.argv.slice(2))) {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
   }
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
 }
 
 // Re-export the MCP server so unit tests can introspect the tool registry
