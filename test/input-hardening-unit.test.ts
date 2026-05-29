@@ -15,9 +15,20 @@
  */
 
 import { strict as assert } from "node:assert";
+import { spawnSync } from "node:child_process";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { before, describe, it } from "node:test";
 
 process.env["INSTANODE_MCP_NO_LISTEN"] = "1";
+
+const SERVER_ENTRY = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  "dist",
+  "index.js"
+);
 
 let server: any;
 let handleCLIFlags: (argv: readonly string[]) => boolean;
@@ -43,6 +54,31 @@ function schemaFor(toolName: string, field: string): any {
 }
 
 // ── BUG-MCP-017: --version / --help ─────────────────────────────────────────
+
+// Spawn the real binary (no INSTANODE_MCP_NO_LISTEN) so the production
+// short-circuit path at the bottom of index.ts is exercised — required for
+// the 100% patch-coverage gate. Tests use --version (small output, exits 0).
+describe("BUG-MCP-017: real-binary short-circuit", () => {
+  it("instanode-mcp --version writes the version to stdout and exits 0", () => {
+    const r = spawnSync(process.execPath, [SERVER_ENTRY, "--version"], {
+      env: { ...process.env, INSTANODE_MCP_NO_LISTEN: "" },
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    assert.equal(r.status, 0, `non-zero exit: stderr=${r.stderr}`);
+    assert.match(r.stdout, /\d+\.\d+\.\d+|dev/);
+  });
+  it("instanode-mcp --help writes the usage block and exits 0", () => {
+    const r = spawnSync(process.execPath, [SERVER_ENTRY, "--help"], {
+      env: { ...process.env, INSTANODE_MCP_NO_LISTEN: "" },
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    assert.equal(r.status, 0, `non-zero exit: stderr=${r.stderr}`);
+    assert.match(r.stdout, /instanode-mcp/);
+    assert.match(r.stdout, /Usage:/);
+  });
+});
 
 describe("BUG-MCP-017: CLI flag short-circuits", () => {
   it("returns true for --version", () => {
@@ -130,6 +166,77 @@ describe("BUG-MCP-022: allowed_ips zod array", () => {
   });
 });
 
+describe("BUG-MCP-022: isIPOrCIDR exhaustive branches", () => {
+  it("rejects over-long input (>64 chars)", () => {
+    assert.equal(isIPOrCIDR("1".repeat(65)), false);
+  });
+  it("rejects bad IPv4 with NaN octet", () => {
+    assert.equal(isIPOrCIDR("10.0.0.x"), false);
+  });
+  it("rejects IPv4 CIDR with mask >32", () => {
+    assert.equal(isIPOrCIDR("10.0.0.0/33"), false);
+  });
+  it("accepts IPv4 CIDR /0 boundary", () => {
+    assert.equal(isIPOrCIDR("0.0.0.0/0"), true);
+  });
+  it("rejects IPv6 with two ::", () => {
+    assert.equal(isIPOrCIDR("2001::db8::1"), false);
+  });
+  it("rejects all-hex but no colon (treated as not IPv6)", () => {
+    assert.equal(isIPOrCIDR("abcd"), false);
+  });
+  it("rejects IPv6 CIDR with mask >128", () => {
+    assert.equal(isIPOrCIDR("2001:db8::/129"), false);
+  });
+  it("accepts plain IPv6 (no CIDR)", () => {
+    assert.equal(isIPOrCIDR("::1"), true);
+  });
+  it("rejects mask that is not an integer", () => {
+    assert.equal(isIPOrCIDR("10.0.0.0/abc"), false);
+    assert.equal(isIPOrCIDR("2001:db8::/abc"), false);
+  });
+});
+
+// BUG-MCP-021 — coupling handler. These hit the early-return branches
+// inside the create_deploy handler.
+describe("BUG-MCP-021: create_deploy private+allowed_ips coupling (handler)", () => {
+  function getHandler(): (p: any) => Promise<any> {
+    const t = server._registeredTools?.create_deploy;
+    return t.handler ?? t.cb ?? t.callback;
+  }
+  it("rejects private=true with empty allowed_ips", async () => {
+    const h = getHandler();
+    const r = await h({
+      tarball_base64: "aGVsbG8=",
+      name: "u-priv-empty",
+      private: true,
+      allowed_ips: [],
+    });
+    const txt = (r.content ?? []).map((c: any) => c.text ?? "").join("\n");
+    assert.match(txt, /private=true requires a non-empty allowed_ips/);
+  });
+  it("rejects private=true with missing allowed_ips", async () => {
+    const h = getHandler();
+    const r = await h({
+      tarball_base64: "aGVsbG8=",
+      name: "u-priv-missing",
+      private: true,
+    });
+    const txt = (r.content ?? []).map((c: any) => c.text ?? "").join("\n");
+    assert.match(txt, /private=true requires a non-empty allowed_ips/);
+  });
+  it("warns when allowed_ips is set but private is falsy", async () => {
+    const h = getHandler();
+    const r = await h({
+      tarball_base64: "aGVsbG8=",
+      name: "u-priv-false-ips",
+      allowed_ips: ["10.0.0.0/8"],
+    });
+    const txt = (r.content ?? []).map((c: any) => c.text ?? "").join("\n");
+    assert.match(txt, /allowed_ips set but private=false/);
+  });
+});
+
 // ── BUG-MCP-024 / 025: UUID schemas ─────────────────────────────────────────
 
 describe("BUG-MCP-024/025: UUID validation on token/id fields", () => {
@@ -165,9 +272,47 @@ describe("BUG-MCP-040: validateBaseURL", () => {
     assert.equal(validateBaseURL("javascript:alert(1)"), null);
     assert.equal(validateBaseURL("file:///etc/passwd"), null);
   });
-  it("rejects empty / garbage", () => {
+  it("rejects empty / garbage (URL constructor throws → catch branch)", () => {
     assert.equal(validateBaseURL(""), null);
     assert.equal(validateBaseURL("   "), null);
-    assert.equal(validateBaseURL("::not a url"), null);
+    assert.equal(validateBaseURL("not a url"), null);
+    assert.equal(validateBaseURL("http://"), null); // empty host
+    assert.equal(validateBaseURL(":/foo"), null);   // URL ctor throws
+  });
+});
+
+describe("BUG-MCP-040: InstantClient constructor falls back on bad URL", () => {
+  it("warns on stderr and falls back to default when override URL is bad", async () => {
+    const { InstantClient } = await import("../src/client.js");
+    const origWrite = process.stderr.write.bind(process.stderr);
+    let captured = "";
+    (process.stderr as any).write = (chunk: any) => {
+      captured += String(chunk);
+      return true;
+    };
+    try {
+      const c = new InstantClient({ baseURL: "javascript:alert(1)" });
+      assert.equal(c.apiBaseURL(), "https://api.instanode.dev");
+      assert.match(captured, /refusing INSTANODE_API_URL/);
+      assert.match(captured, /Falling back/);
+    } finally {
+      (process.stderr as any).write = origWrite;
+    }
+  });
+  it("accepts a valid override URL silently", async () => {
+    const { InstantClient } = await import("../src/client.js");
+    const origWrite = process.stderr.write.bind(process.stderr);
+    let captured = "";
+    (process.stderr as any).write = (chunk: any) => {
+      captured += String(chunk);
+      return true;
+    };
+    try {
+      const c = new InstantClient({ baseURL: "http://localhost:8080/" });
+      assert.equal(c.apiBaseURL(), "http://localhost:8080");
+      assert.equal(captured, "");
+    } finally {
+      (process.stderr as any).write = origWrite;
+    }
   });
 });
