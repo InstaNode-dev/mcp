@@ -384,7 +384,10 @@ describe("tool handlers — deployment lifecycle", () => {
     });
     const text = flat(res);
     assert.match(text, /Deployment accepted/);
-    assert.match(text, /Deploy ID:\s+app-/);
+    // BUG-MCP-025: mock now returns a UUID-shaped app_id matching the real
+    // API contract. Accept either the historical "app-" prefix (in case a
+    // legacy mock revives it) or a canonical UUID.
+    assert.match(text, /Deploy ID:\s+(app-|[0-9a-f]{8}-[0-9a-f]{4}-)/);
     assert.match(text, /Status:\s+building/);
     assert.match(text, /Build logs:/);
     assert.match(text, /Poll for terminal status:/);

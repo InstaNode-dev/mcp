@@ -658,8 +658,13 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
       }
     }
 
+    // BUG-MCP-025: app_id is now validated as a UUID on the get/redeploy/
+    // delete paths, matching the real API contract. The previous
+    // `app-{shortid}` mock id silently passed because the schema was a
+    // bare string; now the mock returns a UUID-shaped app_id like prod so
+    // the test fixtures don't trip the schema.
     const id = randomUUID();
-    const appId = `app-${id.slice(0, 8)}`;
+    const appId = id;
     const deployment: MockDeployment = {
       id,
       app_id: appId,

@@ -240,6 +240,66 @@ const envSchema = z
     "Resource environment scope: 'development' (server default — see CLAUDE.md convention #11 / migration 026), 'staging', or 'production'. Format: ^[a-z0-9-]{1,32}$ — lowercase letters, digits, and dashes only. Omitting `env` lands the resource in 'development' (lowest stakes). The response echoes the resolved `env` so callers can confirm the bucket."
   );
 
+// BUG-MCP-024/025: client-side UUID validation for resource tokens and
+// deployment ids. The API itself rejects malformed tokens with a 400 +
+// `invalid_token` envelope, but catching it client-side surfaces a precise
+// zod error to the calling agent (no wasted round-trip, no opaque API error
+// string). Accepts canonical 8-4-4-4-12 form, case-insensitive.
+const UUID_REGEX =
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+// BUG-MCP-022: client-side IP-or-CIDR validation for the `allowed_ips` field
+// on create_deploy. Accepts:
+//   - IPv4 address (e.g. "203.0.113.42")
+//   - IPv4 CIDR    (e.g. "10.0.0.0/8")
+//   - IPv6 address (e.g. "2001:db8::1")
+//   - IPv6 CIDR    (e.g. "2001:db8::/32")
+// Loose-but-targeted — full RFC 5952 grammar would be heavy for a ~15-line
+// gain; the API still does authoritative validation. Goal here is to catch
+// obvious typos (`192.168.1`, `::/0g`) before the multipart upload.
+export function isIPOrCIDR(s: string): boolean {
+  if (s.length === 0 || s.length > 64) return false;
+  // Split off optional CIDR mask.
+  const slash = s.indexOf("/");
+  const host = slash >= 0 ? s.slice(0, slash) : s;
+  const maskStr = slash >= 0 ? s.slice(slash + 1) : "";
+  // IPv4 host check.
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (v4) {
+    for (let i = 1; i <= 4; i++) {
+      const n = Number(v4[i]);
+      if (!Number.isInteger(n) || n < 0 || n > 255) return false;
+    }
+    if (slash < 0) return true;
+    const m = Number(maskStr);
+    return Number.isInteger(m) && m >= 0 && m <= 32;
+  }
+  // IPv6 host check (very loose — hex groups separated by ':' with at most
+  // one '::'). Forbid anything non-hex / non-':' / non-'.' (IPv4-mapped).
+  if (!/^[0-9a-fA-F:.]+$/.test(host)) return false;
+  if ((host.match(/::/g) ?? []).length > 1) return false;
+  // Must contain at least one ':' to be considered v6.
+  if (!host.includes(":")) return false;
+  if (slash < 0) return true;
+  const m = Number(maskStr);
+  return Number.isInteger(m) && m >= 0 && m <= 128;
+}
+
+const uuidSchema = z
+  .string()
+  .regex(
+    UUID_REGEX,
+    "must be a UUID in canonical 8-4-4-4-12 form (e.g. 8b1f3c9e-...-...)"
+  );
+
+const ipOrCidrSchema = z
+  .string()
+  .min(1)
+  .refine(isIPOrCIDR, {
+    message:
+      "must be an IPv4/IPv6 address or CIDR (e.g. '203.0.113.42', '10.0.0.0/8', '2001:db8::/32')",
+  });
+
 const envArg = {
   env: envSchema,
 };
@@ -794,10 +854,9 @@ ACL / storage prefix cleanup automatically.
 
 Requires INSTANODE_TOKEN.`,
   {
-    token: z
-      .string()
-      .min(1)
-      .describe("Resource token (UUID) to delete."),
+    // BUG-MCP-024: validate the UUID shape client-side so a typo'd token
+    // surfaces as a zod error rather than an API 400 round-trip.
+    token: uuidSchema.describe("Resource token (UUID) to delete."),
   },
   async ({ token }) => {
     try {
@@ -927,11 +986,21 @@ tarball" hint instead of being uploaded and rejected server-side.
 
 Requires INSTANODE_TOKEN (anonymous tier cannot deploy).`,
   {
+    // BUG-MCP-020: cap the tarball at the API's documented 50 MiB limit
+    // BEFORE we POST. base64 inflates raw bytes by ~4/3 → a 50 MiB decoded
+    // tarball is ~66.7 MiB encoded. Reject anything over 70 MiB encoded so
+    // we surface a precise zod error instead of multiparting a payload that
+    // the API will only reject after upload. minLength:1 stays for the
+    // empty-string case.
     tarball_base64: z
       .string()
       .min(1)
+      .max(
+        70 * 1024 * 1024,
+        "tarball_base64: encoded payload exceeds 70 MiB (≈50 MiB decoded). Shrink the tarball — strip .git, node_modules, build artifacts."
+      )
       .describe(
-        "Base64-encoded gzip tarball of the project directory (must include a Dockerfile at the root). <50 MB after decode."
+        "Base64-encoded gzip tarball of the project directory (must include a Dockerfile at the root). <50 MB after decode (≈70 MiB encoded)."
       ),
     // BugBash B16 F2 (regression of task #173): same name regex as every other
     // create_* tool — mirrors the api's contract via nameSchema.
@@ -986,14 +1055,46 @@ Requires INSTANODE_TOKEN (anonymous tier cannot deploy).`,
       .describe(
         "When true, the deploy is only reachable from IPs in 'allowed_ips'. Requires Pro tier or higher — anonymous and hobby callers get HTTP 402 with an agent_action prompting the user to upgrade. Use for CRMs, internal dashboards, staging apps."
       ),
+    // BUG-MCP-022: validate each entry is an IP or CIDR. Bound the array at
+    // 256 entries — Ingress allowlist of this size is already exotic; cap is
+    // here to prevent a hostile-host runaway. Authoritative check stays
+    // server-side; this catches obvious typos before the round-trip.
     allowed_ips: z
-      .array(z.string().min(1))
+      .array(ipOrCidrSchema)
+      .max(256, "allowed_ips: at most 256 entries")
       .optional()
       .describe(
-        "IP / CIDR allowlist enforced at the Ingress when 'private' is true. Examples: ['1.2.3.4', '10.0.0.0/8', '203.0.113.42/32']. Required when private=true; ignored otherwise. If Track A's backend lands with a renamed field (e.g. 'allowed_cidrs'), this MCP tool will surface the 400 verbatim — see PR body."
+        "IP / CIDR allowlist enforced at the Ingress when 'private' is true. Examples: ['1.2.3.4', '10.0.0.0/8', '203.0.113.42/32']. Required when private=true; ignored otherwise. Max 256 entries; each must parse as IPv4/IPv6 address or CIDR."
       ),
   },
+  // BUG-MCP-021: enforce the documented private+allowed_ips coupling
+  // client-side. The API rejects (private=true, allowed_ips=[]) with a 400,
+  // but doing it here makes the failure mode crisp and stops the agent from
+  // shipping a payload that's structurally guaranteed to fail.
   async (params) => {
+    if (params.private === true) {
+      if (!params.allowed_ips || params.allowed_ips.length === 0) {
+        return textResult(
+          [
+            `create_deploy: private=true requires a non-empty allowed_ips list.`,
+            ``,
+            `Pass an array of IPs/CIDRs (e.g. ['203.0.113.42/32', '10.0.0.0/8'])`,
+            `or set private=false to make the deploy publicly reachable.`,
+          ].join("\n")
+        );
+      }
+    } else if (params.allowed_ips && params.allowed_ips.length > 0) {
+      // The API silently drops allowed_ips when private=false; tell the
+      // agent so the misconfiguration is visible.
+      return textResult(
+        [
+          `create_deploy: allowed_ips set but private=false (or omitted).`,
+          ``,
+          `Set private=true to enforce the allowlist, or remove allowed_ips`,
+          `to make the field's absence intentional.`,
+        ].join("\n")
+      );
+    }
     try {
       const result = await client.createDeploy(params);
       const lines = [
@@ -1289,10 +1390,8 @@ single record.
 
 Requires INSTANODE_TOKEN.`,
   {
-    id: z
-      .string()
-      .min(1)
-      .describe("Deployment app id (returned as 'deploy_id' by create_deploy)."),
+    // BUG-MCP-025: validate UUID client-side.
+    id: uuidSchema.describe("Deployment app id (returned as 'deploy_id' by create_deploy)."),
   },
   async ({ id }) => {
     try {
@@ -1353,10 +1452,8 @@ to "running".
 
 Requires INSTANODE_TOKEN.`,
   {
-    id: z
-      .string()
-      .min(1)
-      .describe("Deployment app id (returned as 'deploy_id' by create_deploy)."),
+    // BUG-MCP-025: validate UUID client-side.
+    id: uuidSchema.describe("Deployment app id (returned as 'deploy_id' by create_deploy)."),
   },
   async ({ id }) => {
     try {
@@ -1391,10 +1488,8 @@ deleted. Irreversible.
 
 Requires INSTANODE_TOKEN.`,
   {
-    id: z
-      .string()
-      .min(1)
-      .describe("Deployment app id (returned as 'deploy_id' by create_deploy)."),
+    // BUG-MCP-025: validate UUID client-side.
+    id: uuidSchema.describe("Deployment app id (returned as 'deploy_id' by create_deploy)."),
   },
   async ({ id }) => {
     try {
@@ -1413,7 +1508,66 @@ Requires INSTANODE_TOKEN.`,
   }
 );
 
+// ── CLI flags (BUG-MCP-017) ────────────────────────────────────────────────────
+
+// `instanode-mcp --version` and `instanode-mcp --help` short-circuit before
+// the stdio transport binds, so operators / package managers can probe the
+// binary without it sitting forever waiting on stdin. Stdout-friendly, exit
+// 0. Unknown flags fall through to the normal stdio loop so a hostile MCP
+// host can't force the process to exit by sending a stray "--whatever".
+export function handleCLIFlags(argv: readonly string[]): boolean {
+  for (const a of argv) {
+    if (a === "-h" || a === "--help") {
+      process.stdout.write(
+        [
+          `instanode-mcp ${pkgVersion}`,
+          `MCP server for instanode.dev — exposes provisioning + deploy tools to AI agents.`,
+          ``,
+          `Usage: instanode-mcp [--version] [--help]`,
+          ``,
+          `By default the binary speaks MCP over stdio. Configure it as the`,
+          `command in your Claude Code / Cursor / Windsurf MCP settings.`,
+          ``,
+          `Env vars:`,
+          `  INSTANODE_TOKEN         Bearer token from the dashboard (paid-tier tools).`,
+          `  INSTANODE_API_URL       Override the API base URL (default https://api.instanode.dev).`,
+          `  INSTANODE_DASHBOARD_URL Override the dashboard URL (default https://instanode.dev).`,
+          ``,
+        ].join("\n")
+      );
+      return true;
+    }
+    if (a === "-v" || a === "--version") {
+      process.stdout.write(`${pkgVersion}\n`);
+      return true;
+    }
+  }
+  return false;
+}
+
 // ── Start server ──────────────────────────────────────────────────────────────
+
+// maybeShortCircuit invokes handleCLIFlags(argv); if a CLI flag was handled,
+// calls exit() to terminate the process. Returns true when it short-circuited,
+// false otherwise. Extracted so unit tests can drive both branches without
+// touching process.argv or actually exiting the test runner.
+export function maybeShortCircuit(
+  argv: readonly string[],
+  exit: (code: number) => void = process.exit
+): boolean {
+  if (handleCLIFlags(argv)) {
+    exit(0);
+    return true;
+  }
+  return false;
+}
+
+// BUG-MCP-017: CLI flag short-circuit runs OUTSIDE the no-listen guard so the
+// real binary (which never sets INSTANODE_MCP_NO_LISTEN) can be probed for
+// --version / --help without sitting on stdin. The exported helper makes
+// both the short-circuit-true and fall-through-false branches reachable
+// from unit tests via an injected exit fn — see input-hardening-unit.test.ts.
+maybeShortCircuit(process.argv.slice(2));
 
 // Unit tests import this module purely to reach the exported helpers
 // (formatError / formatLimits / appendUpgradeBlock) without binding to a real

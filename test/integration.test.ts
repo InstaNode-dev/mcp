@@ -699,7 +699,12 @@ describe("instanode-mcp integration suite", () => {
     it("get_deployment returns a not-found error for an unknown app id", async () => {
       const { client, close } = await connectClient(mock.url, "valid");
       try {
-        const res = await client.callTool({ name: "get_deployment", arguments: { id: "app-doesnotexist" } });
+        // BUG-MCP-025: id must be a real UUID — supply one the mock doesn't
+        // know about so the API still returns 404.
+        const res = await client.callTool({
+          name: "get_deployment",
+          arguments: { id: "00000000-0000-4000-8000-000000000404" },
+        });
         assert.ok(/404|not found/i.test(resultText(res)), "get_deployment did not surface a 404");
       } finally {
         await close();
@@ -709,7 +714,11 @@ describe("instanode-mcp integration suite", () => {
     it("redeploy returns a not-found error for an unknown app id", async () => {
       const { client, close } = await connectClient(mock.url, "valid");
       try {
-        const res = await client.callTool({ name: "redeploy", arguments: { id: "app-doesnotexist" } });
+        // BUG-MCP-025: see above — UUID-shaped + unknown.
+        const res = await client.callTool({
+          name: "redeploy",
+          arguments: { id: "00000000-0000-4000-8000-000000000404" },
+        });
         assert.ok(/404|not found/i.test(resultText(res)), "redeploy did not surface a 404");
       } finally {
         await close();
