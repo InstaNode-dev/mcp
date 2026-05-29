@@ -210,6 +210,29 @@ const nameArg = {
   name: nameSchema,
 };
 
+// Shared `env` field surfaced on every provisioning tool. CLI-MCP FINDING-8:
+// before this, the MCP dropped `env` entirely on every provisioning call, so
+// the api silently landed every anonymous-ish call in the "development" bucket
+// (mig 026 / CLAUDE.md convention #11) — agents had no way to ask for a
+// `staging` or `production` resource through MCP. Adding it here means: (a)
+// the param surfaces in tools/list, so an LLM can populate it; (b) the
+// client passes it through to the api; (c) the response echoes it (`env`
+// field on every /<resource>/new body since mig 026) so the agent can confirm
+// which bucket the resource landed in. Omitting `env` keeps the existing
+// behavior (server-side default `development`).
+const envArg = {
+  env: z
+    .string()
+    .optional()
+    .describe(
+      "Resource environment scope: 'development' (server default — see CLAUDE.md convention #11 / migration 026), 'staging', or 'production'. Omitting `env` lands the resource in 'development' (lowest stakes). The response echoes the resolved `env` so callers can confirm the bucket."
+    ),
+};
+
+// Convenience: every create_* tool that only needs name + optional env. Spread
+// in place of `nameArg` to add the env passthrough.
+const nameAndEnvArg = { ...nameArg, ...envArg };
+
 // ── Tool: create_postgres ─────────────────────────────────────────────────────
 
 server.tool(
@@ -230,10 +253,10 @@ delete_resource for anonymous tokens, by design. On a paid tier, call
 delete_resource to tear down on demand.
 
 Store the connection_url in an env var (DATABASE_URL); do not hardcode it.`,
-  nameArg,
-  async ({ name }) => {
+  nameAndEnvArg,
+  async ({ name, env }) => {
     try {
-      const result = await client.createPostgres(name);
+      const result = await client.createPostgres(name, env);
       const lines = [
         `Postgres database provisioned.`,
         `Token:          ${result.token}`,
@@ -287,6 +310,7 @@ With INSTANODE_TOKEN (paid): hobby/pro/team Postgres limits, permanent.
 The 'name' field is required.`,
   {
     ...nameArg,
+    ...envArg,
     dimensions: z
       .number()
       .int()
@@ -297,9 +321,9 @@ The 'name' field is required.`,
         "Optional embedding dimension hint (defaults to 1536 — OpenAI text-embedding-3-small / ada-002). Use 3072 for text-embedding-3-large. Informational only; pgvector enforces dimensions per column at table-create time."
       ),
   },
-  async ({ name, dimensions }) => {
+  async ({ name, env, dimensions }) => {
     try {
-      const result = await client.createVector(name, dimensions);
+      const result = await client.createVector(name, dimensions, env);
       const lines = [
         `pgvector Postgres database provisioned.`,
         `Token:          ${result.token}`,
@@ -338,17 +362,18 @@ Drop in as REDIS_URL with any Redis client (ioredis, node-redis, go-redis, etc.)
 
 Without INSTANODE_TOKEN: anonymous tier — 5 MB, 24h TTL. The response carries
 'note' + 'upgrade' (claim URL) — surface both verbatim.
-With INSTANODE_TOKEN (paid): hobby 25 MB / pro 256 MB / team unlimited, permanent.
+With INSTANODE_TOKEN (paid): hobby 50 MB / hobby_plus 50 MB / pro 512 MB /
+growth 1024 MB / team unlimited (per api/plans.yaml), permanent.
 
 Cleanup: anonymous resources auto-expire after 24h — there is no on-demand
 delete for anonymous tokens, by design. On a paid tier, call
 delete_resource to tear down on demand.
 
 The 'name' field is required.`,
-  nameArg,
-  async ({ name }) => {
+  nameAndEnvArg,
+  async ({ name, env }) => {
     try {
-      const result = await client.createCache(name);
+      const result = await client.createCache(name, env);
       const lines = [
         `Redis cache provisioned.`,
         `Token:          ${result.token}`,
@@ -389,10 +414,10 @@ delete for anonymous tokens, by design. On a paid tier, call
 delete_resource to tear down on demand.
 
 The 'name' field is required.`,
-  nameArg,
-  async ({ name }) => {
+  nameAndEnvArg,
+  async ({ name, env }) => {
     try {
-      const result = await client.createNoSQL(name);
+      const result = await client.createNoSQL(name, env);
       const lines = [
         `MongoDB database provisioned.`,
         `Token:          ${result.token}`,
@@ -433,10 +458,10 @@ delete for anonymous tokens, by design. On a paid tier, call
 delete_resource to tear down on demand.
 
 The 'name' field is required.`,
-  nameArg,
-  async ({ name }) => {
+  nameAndEnvArg,
+  async ({ name, env }) => {
     try {
-      const result = await client.createQueue(name);
+      const result = await client.createQueue(name, env);
       const lines = [
         `NATS JetStream queue provisioned.`,
         `Token:          ${result.token}`,
@@ -485,10 +510,10 @@ prefix are removed by the bucket lifecycle policy. On a paid tier, call
 delete_resource to tear down on demand.
 
 The 'name' field is required.`,
-  nameArg,
-  async ({ name }) => {
+  nameAndEnvArg,
+  async ({ name, env }) => {
     try {
-      const result = await client.createStorage(name);
+      const result = await client.createStorage(name, env);
       const lines = [
         `Object storage bucket prefix provisioned.`,
         `Token:             ${result.token}`,
@@ -536,10 +561,10 @@ With INSTANODE_TOKEN (paid): 1000+ stored per tier, permanent.
 Cleanup: anonymous webhook receivers auto-expire after 24h — there is no
 on-demand delete for anonymous tokens, by design. On a paid tier, call
 delete_resource to tear down on demand.`,
-  nameArg,
-  async ({ name }) => {
+  nameAndEnvArg,
+  async ({ name, env }) => {
     try {
-      const result = await client.createWebhook(name);
+      const result = await client.createWebhook(name, env);
       const lines = [
         `Webhook receiver provisioned.`,
         `Token:       ${result.token}`,
@@ -907,7 +932,7 @@ Requires INSTANODE_TOKEN (anonymous tier cannot deploy).`,
       .string()
       .optional()
       .describe(
-        "Deploy environment scope: 'production' (default), 'staging', or 'development'. Each scope has its own vault and env_vars."
+        "Deploy environment scope: 'development' (default — see CLAUDE.md convention #11 / migration 026), 'staging', or 'production'. Omitting `env` lands the deploy in 'development' (lowest stakes), so accidental no-env deploys can't merge with prod state. Each scope has its own vault and env_vars."
       ),
     env_vars: z
       .record(z.string(), z.string())
@@ -961,6 +986,172 @@ Requires INSTANODE_TOKEN (anonymous tier cannot deploy).`,
         ``,
         `When status="running", the live URL is ready. Typical build time ~30s.`
       );
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
+    }
+  }
+);
+
+// ── Tool: create_stack ────────────────────────────────────────────────────────
+
+server.tool(
+  "create_stack",
+  `Deploy a multi-service bundle from a single MCP call (POST /stacks/new).
+
+The wedge: one tool call → a live URL on *.deployment.instanode.dev for an
+\`instant.yaml\`-shaped manifest declaring 1..N services. Each service has its
+own build context (tarball), Dockerfile, port, optional Ingress (\`expose: true\`),
+and resource deps (\`needs: [postgres, redis]\` to auto-provision and bind, or
+\`kind: postgres\` blocks inline). Cross-service references use
+\`service://<name>\` in env values — these resolve to cluster-internal
+\`http://<name>:<port>\` URLs at deploy time.
+
+ANONYMOUS-FRIENDLY: no INSTANODE_TOKEN required. Anonymous stacks land at the
+anonymous tier with a 24h TTL, rate-limited by /24-subnet fingerprint. The
+response carries the same 'note' + 'upgrade' (claim) URL as create_postgres so
+the agent can prompt the user to keep the stack past 24h. With INSTANODE_TOKEN
+the stack inherits the user's plan tier and is permanent.
+
+Multipart shape (the client builds this for you):
+  - \`name\` (text, required)
+  - \`manifest\` (text, the YAML body)
+  - One binary file part PER service declared in the manifest, named after the
+    service. The MCP receives them as a \`{ <service-name>: <base64-gzip> }\`
+    object — pass the same base64-encoded gzip tarball you'd pass to
+    create_deploy, one per service.
+
+Example manifest:
+  services:
+    app:
+      build: .
+      port: 8080
+      expose: true
+      env:
+        DATABASE_URL: service://postgres
+        REDIS_URL: service://redis
+    postgres:
+      kind: postgres
+    redis:
+      kind: cache
+
+Build is asynchronous: the initial response carries status="building"; poll
+'get_stack' with the returned 'stack_id' until status="healthy" (~30s typical).
+Overall status is "healthy" only when every service is healthy.
+
+Each tarball: gzip(tar(<service-build-dir>)) → base64, cap 50 MiB per service
+(client-enforced). Total request body cap is 200 MB across all services (api).
+
+Returns: stack_id, status, tier, env, per-service { name, port, expose, url,
+status } (only exposed services get a public URL), expires_in (24h on anon),
+plus the anonymous-tier upgrade fields.`,
+  {
+    name: nameSchema,
+    manifest: z
+      .string()
+      .min(1)
+      .describe(
+        "instant.yaml text. MUST declare a top-level `services:` map; each service entry takes build/port/expose/env/needs/kind fields. Cross-service refs use service://<name>. See the example in this tool's description."
+      ),
+    service_tarballs: z
+      .record(z.string().min(1), z.string().min(1))
+      .describe(
+        "Map of service-name → base64-encoded gzip tarball of that service's build context (Dockerfile + source). One entry per service declared in the manifest that has a `build:` field. Cap: 50 MiB per service after base64 decode."
+      ),
+    env: z
+      .string()
+      .optional()
+      .describe(
+        "Resource environment scope: 'development' (server default — see CLAUDE.md convention #11 / migration 026), 'staging', or 'production'. Omitting `env` lands the stack in 'development' (lowest stakes). The response echoes the resolved `env`."
+      ),
+  },
+  async ({ name, manifest, service_tarballs, env }) => {
+    try {
+      const result = await client.createStack({
+        name,
+        manifest,
+        service_tarballs,
+        env,
+      });
+      const lines = [
+        `Stack accepted (build is asynchronous).`,
+        `Stack ID:   ${result.stack_id}`,
+        `Status:     ${result.status}`,
+        `Tier:       ${result.tier}`,
+      ];
+      if (result.env) lines.push(`Environment: ${result.env}`);
+      if (result.name) lines.push(`Name:       ${result.name}`);
+      if (result.expires_in) lines.push(`Expires in: ${result.expires_in}`);
+      if (Array.isArray(result.services) && result.services.length > 0) {
+        lines.push(``, `Services (${result.services.length}):`);
+        for (const svc of result.services) {
+          const urlPart = svc.url
+            ? ` → ${svc.url}`
+            : svc.expose
+              ? ` → (URL pending — poll get_stack)`
+              : ` (cluster-internal http://${svc.name}:${svc.port})`;
+          lines.push(`  [${svc.status}] ${svc.name} :${svc.port}${urlPart}`);
+        }
+      }
+      appendUpgradeBlock(lines, result);
+      lines.push(
+        ``,
+        `Poll for terminal status:`,
+        `  get_stack({ stack_id: "${result.stack_id}" })`,
+        ``,
+        `Stack is "healthy" only when every service is healthy. Typical ~30s.`
+      );
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
+    }
+  }
+);
+
+// ── Tool: get_stack ───────────────────────────────────────────────────────────
+
+server.tool(
+  "get_stack",
+  `Fetch a stack by id (GET /stacks/{stack_id}). Use this after create_stack to
+poll until every service is "healthy" (~30s typical).
+
+Anonymous-friendly: the public /stacks/{slug} route mirrors the StackResponse
+shape returned by POST /stacks/new (services array, expires_in, etc.) and
+does not require INSTANODE_TOKEN — anonymous callers can poll their own
+stacks. The dashboard-only GET /api/v1/stacks/{slug} returns a flatter
+summary and requires auth; this tool uses the public route.
+
+Returns the same shape as create_stack: stack_id, status, tier, env,
+per-service { name, port, expose, url, status }, expires_in.`,
+  {
+    stack_id: z
+      .string()
+      .min(1)
+      .describe("Stack id (returned as 'stack_id' by create_stack). Format: stk-<8-char-hex>."),
+  },
+  async ({ stack_id }) => {
+    try {
+      const result = await client.getStack(stack_id);
+      const lines = [
+        `Stack ${result.stack_id ?? stack_id}`,
+        `Status:     ${result.status ?? "(unknown)"}`,
+        `Tier:       ${result.tier ?? "(unknown)"}`,
+      ];
+      if (result.env) lines.push(`Environment: ${result.env}`);
+      if (result.name) lines.push(`Name:       ${result.name}`);
+      if (result.expires_in) lines.push(`Expires in: ${result.expires_in}`);
+      if (Array.isArray(result.services) && result.services.length > 0) {
+        lines.push(``, `Services (${result.services.length}):`);
+        for (const svc of result.services) {
+          const urlPart = svc.url
+            ? ` → ${svc.url}`
+            : svc.expose
+              ? ` → (URL pending)`
+              : ` (cluster-internal http://${svc.name}:${svc.port})`;
+          lines.push(`  [${svc.status}] ${svc.name} :${svc.port}${urlPart}`);
+        }
+      }
+      appendUpgradeBlock(lines, result);
       return textResult(lines.join("\n"));
     } catch (err) {
       return textResult(formatError(err));

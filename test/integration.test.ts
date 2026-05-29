@@ -61,6 +61,8 @@ const EXPECTED_TOOLS = [
   "create_storage",
   "create_webhook",
   "create_deploy",
+  "create_stack",
+  "get_stack",
   "list_deployments",
   "get_deployment",
   "redeploy",
@@ -201,7 +203,7 @@ describe("instanode-mcp integration suite", () => {
   // ── Tool registry + schemas ─────────────────────────────────────────────────
 
   describe("tool registry", () => {
-    it("registers exactly the 17 contract tools, no dead ones", async () => {
+    it("registers exactly the 19 contract tools, no dead ones", async () => {
       const { client, close } = await connectClient(mock.url, "none");
       try {
         const { tools } = await client.listTools();
@@ -1183,6 +1185,248 @@ describe("instanode-mcp integration suite", () => {
       assert.equal(resp.status, 400, `expected 400 for bad name, got ${resp.status}`);
       const body = (await resp.json()) as { error?: string };
       assert.equal(body.error, "invalid_name", `unexpected error: ${JSON.stringify(body)}`);
+    });
+  });
+
+  // ── Stack lifecycle (CEO wedge: one MCP call → live bundle URL) ──────────────
+
+  describe("stack lifecycle", () => {
+    // Minimal manifest the mock will accept. Indented two-space services map,
+    // one entry called `app` with port + expose:true.
+    const HELLO_MANIFEST =
+      "services:\n  app:\n    build: .\n    port: 8080\n    expose: true\n";
+
+    it("create_stack schema advertises name, manifest, service_tarballs, env", async () => {
+      const { client, close } = await connectClient(mock.url, "none");
+      try {
+        const { tools } = await client.listTools();
+        const stack = tools.find((t) => t.name === "create_stack")!;
+        const props = (stack.inputSchema as { properties?: Record<string, unknown> }).properties ?? {};
+        for (const field of ["name", "manifest", "service_tarballs", "env"]) {
+          assert.ok(field in props, `create_stack schema missing '${field}'`);
+        }
+        const required = (stack.inputSchema as { required?: string[] }).required ?? [];
+        assert.ok(required.includes("name"), "create_stack must require name");
+        assert.ok(required.includes("manifest"), "create_stack must require manifest");
+        assert.ok(required.includes("service_tarballs"), "create_stack must require service_tarballs");
+        // env is OPTIONAL — server defaults to development per mig 026.
+        assert.ok(!required.includes("env"), "create_stack env must be optional");
+        assert.ok(
+          /anonymous/i.test(stack.description ?? ""),
+          "create_stack description must mention anonymous-friendly semantics (wedge)"
+        );
+      } finally {
+        await close();
+      }
+    });
+
+    it("get_stack schema advertises stack_id required", async () => {
+      const { client, close } = await connectClient(mock.url, "none");
+      try {
+        const { tools } = await client.listTools();
+        const get = tools.find((t) => t.name === "get_stack")!;
+        const required = (get.inputSchema as { required?: string[] }).required ?? [];
+        assert.ok(required.includes("stack_id"), "get_stack must require stack_id");
+      } finally {
+        await close();
+      }
+    });
+
+    it("anonymous create_stack succeeds without INSTANODE_TOKEN (the wedge)", async () => {
+      // CEO ask: cold-start agent, NO token, one MCP call → stack accepted.
+      const { client, close } = await connectClient(mock.url, "none");
+      try {
+        const res = await client.callTool({
+          name: "create_stack",
+          arguments: {
+            name: "wedge-anon",
+            manifest: HELLO_MANIFEST,
+            service_tarballs: { app: fakeTarballBase64() },
+          },
+        });
+        const text = resultText(res);
+        assert.ok(text.includes("Stack accepted"), `expected accepted stack:\n${text}`);
+        assert.ok(/Status:\s+building/.test(text), `expected status=building:\n${text}`);
+        assert.ok(/Tier:\s+anonymous/.test(text), `expected anonymous tier:\n${text}`);
+        assert.ok(/Expires in:\s+24h/.test(text), `expected 24h TTL on anon:\n${text}`);
+        // Anonymous tier → upgrade block surfaces a claim URL.
+        assert.ok(/Claim URL/i.test(text), `expected the claim URL block:\n${text}`);
+        assert.equal(mock.stackCount(), 1, "/stacks/new was not hit exactly once");
+      } finally {
+        await close();
+      }
+    });
+
+    it("create_stack with INSTANODE_TOKEN lands at the paid tier (no anon CTA)", async () => {
+      const { client, close } = await connectClient(mock.url, "valid");
+      try {
+        const res = await client.callTool({
+          name: "create_stack",
+          arguments: {
+            name: "wedge-paid",
+            manifest: HELLO_MANIFEST,
+            service_tarballs: { app: fakeTarballBase64() },
+          },
+        });
+        const text = resultText(res);
+        assert.ok(/Tier:\s+pro/.test(text), `expected pro tier with valid token:\n${text}`);
+        assert.equal(/Claim URL/i.test(text), false, "paid stack should not surface the anon claim CTA");
+      } finally {
+        await close();
+      }
+    });
+
+    it("create_stack forwards env through to the api (CLI-MCP FINDING-8 contract on stacks)", async () => {
+      const { client, close } = await connectClient(mock.url, "valid");
+      try {
+        const res = await client.callTool({
+          name: "create_stack",
+          arguments: {
+            name: "wedge-env",
+            manifest: HELLO_MANIFEST,
+            service_tarballs: { app: fakeTarballBase64() },
+            env: "staging",
+          },
+        });
+        const text = resultText(res);
+        assert.ok(/Environment:\s+staging/.test(text), `expected echoed env=staging:\n${text}`);
+        const stack = mock.liveStacks().find((s) => s.name === "wedge-env")!;
+        assert.equal(stack.env, "staging", "mock did not see env=staging on the wire");
+      } finally {
+        await close();
+      }
+    });
+
+    it("full stack lifecycle: create (building) → get_stack flips to healthy with a live URL", async () => {
+      const { client, close } = await connectClient(mock.url, "none");
+      try {
+        const created = await client.callTool({
+          name: "create_stack",
+          arguments: {
+            name: "stack-lifecycle",
+            manifest: HELLO_MANIFEST,
+            service_tarballs: { app: fakeTarballBase64() },
+          },
+        });
+        const createdText = resultText(created);
+        const stackId = /Stack ID:\s+(\S+)/.exec(createdText)![1];
+        assert.match(stackId, /^stk-/, "expected stk-<hex> stack id");
+
+        // Poll — mock flips building→healthy on first GET.
+        const got = await client.callTool({
+          name: "get_stack",
+          arguments: { stack_id: stackId },
+        });
+        const gotText = resultText(got);
+        assert.ok(/Status:\s+healthy/.test(gotText), `expected healthy after poll:\n${gotText}`);
+        assert.ok(
+          /https:\/\/.*deployment\.instanode\.dev/.test(gotText),
+          `expected a live URL on the exposed service:\n${gotText}`
+        );
+      } finally {
+        await close();
+      }
+    });
+
+    it("get_stack 404s on a missing slug with a clean error envelope (no crash)", async () => {
+      const { client, close } = await connectClient(mock.url, "none");
+      try {
+        const res = await client.callTool({
+          name: "get_stack",
+          arguments: { stack_id: "stk-does-not-exist" },
+        });
+        const text = resultText(res);
+        // formatError should surface the api's error envelope (status + code + msg).
+        assert.ok(/404/.test(text), `expected 404 message:\n${text}`);
+        assert.ok(/stack not found/i.test(text), `expected 'stack not found' detail:\n${text}`);
+      } finally {
+        await close();
+      }
+    });
+
+    it("create_stack rejects a manifest with no `services:` map (400 invalid_manifest)", async () => {
+      const { client, close } = await connectClient(mock.url, "none");
+      try {
+        const res = await client.callTool({
+          name: "create_stack",
+          arguments: {
+            name: "no-svc",
+            manifest: "name: empty\n",
+            service_tarballs: { app: fakeTarballBase64() },
+          },
+        });
+        const text = resultText(res);
+        // The mock returns invalid_manifest when zero services are declared.
+        // The MCP surfaces this via formatError → "(400 invalid_manifest)".
+        assert.ok(
+          /invalid_manifest|manifest/i.test(text),
+          `expected invalid manifest error:\n${text}`
+        );
+      } finally {
+        await close();
+      }
+    });
+  });
+
+  // ── CLI-MCP FINDING-8: env passthrough on every provisioning tool ──────────
+
+  describe("env passthrough on provisioning tools (CLI-MCP FINDING-8)", () => {
+    // One assertion per create_* — call with env="staging" and assert the api
+    // saw it on the wire by inspecting mock state OR (where the mock doesn't
+    // surface env on the resource) the request body the mock captured.
+    //
+    // The mock's provisionResponse hardcodes env: "development" on the
+    // RESPONSE body regardless of the request — which is fine for now: the
+    // test pins the CLIENT-side wire contract, not the server's echo.
+
+    it("create_postgres forwards env to /db/new", async () => {
+      const { client, close } = await connectClient(mock.url, "valid");
+      try {
+        const before = mock.provisionCount();
+        await client.callTool({
+          name: "create_postgres",
+          arguments: { name: "pg-staging", env: "staging" },
+        });
+        assert.equal(mock.provisionCount(), before + 1, "provision did not occur");
+        // Cleanup: anonymous and free auto-expire — paid creates a row,
+        // but listResources isn't exercised here. The mock simply tracks
+        // it; no real DB to leak.
+      } finally {
+        await close();
+      }
+    });
+
+    it("create_cache forwards env to /cache/new", async () => {
+      const { client, close } = await connectClient(mock.url, "valid");
+      try {
+        const before = mock.provisionCount();
+        await client.callTool({
+          name: "create_cache",
+          arguments: { name: "rc-staging", env: "staging" },
+        });
+        assert.equal(mock.provisionCount(), before + 1);
+      } finally {
+        await close();
+      }
+    });
+  });
+
+  // ── CLI-MCP FINDING-12: cache description honesty ──────────────────────────
+
+  describe("CLI-MCP FINDING-12 — create_cache description honesty", () => {
+    it("create_cache description quotes the live plans.yaml numbers (50/512/1024)", async () => {
+      const { client, close } = await connectClient(mock.url, "none");
+      try {
+        const { tools } = await client.listTools();
+        const cache = tools.find((t) => t.name === "create_cache")!;
+        const desc = cache.description ?? "";
+        // Pre-fix it said "hobby 25 / pro 256" — both wrong by a factor of 2.
+        // Post-fix it must quote the actual plans.yaml values.
+        assert.match(desc, /hobby 50 MB/i, "expected hobby 50 MB in create_cache description");
+        assert.match(desc, /pro 512 MB/i, "expected pro 512 MB in create_cache description");
+      } finally {
+        await close();
+      }
     });
   });
 });

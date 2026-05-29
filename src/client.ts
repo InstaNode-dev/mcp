@@ -281,7 +281,12 @@ export interface CreateDeployParams {
   name: string;
   /** Container HTTP port. Default 8080. */
   port?: number;
-  /** Deploy env scope: production / staging / development. Default "production". */
+  /**
+   * Deploy env scope: development / staging / production. Default
+   * "development" server-side — see CLAUDE.md convention #11 / migration 026.
+   * Omitting `env` lands the deploy in 'development' (lowest stakes) so
+   * accidental no-env deploys can't merge with prod state.
+   */
   env?: string;
   /**
    * env vars dict; values can be plaintext or vault://env/KEY refs. The api
@@ -309,6 +314,77 @@ export interface CreateDeployParams {
    * shape (e.g. `allowed_cidrs`), reconcile post-merge.
    */
   allowed_ips?: string[];
+}
+
+/**
+ * A single service entry in a StackResponse. The api returns one of these per
+ * service declared in the manifest. Only services with `expose: true` get a
+ * public `url`; the rest are reachable in-cluster only via
+ * `http://<service-name>:<port>`.
+ */
+export interface StackService {
+  name: string;
+  status: string;
+  port: number;
+  expose?: boolean;
+  /** Empty string while building or for non-exposed services. */
+  url?: string;
+}
+
+/**
+ * Response shape from POST /stacks/new (HTTP 202 Accepted) and GET /stacks/{slug}.
+ *
+ * Mirrors the `StackResponse` schema in api/internal/handlers/openapi.go. Like
+ * /deploy/new, the build is asynchronous: the initial response carries
+ * status="building"; poll `getStack(stack_id)` until status="healthy" (or
+ * "failed"). Overall status is "healthy" only when every service is healthy.
+ */
+export interface StackResult {
+  ok: boolean;
+  /** Format: stk-<8-char-hex>. Use this for getStack / GET /stacks/{slug}. */
+  stack_id: string;
+  status: string;
+  tier: string;
+  /** Resolved env bucket (defaults to 'development' — see CLAUDE.md #11). */
+  env?: string;
+  name?: string;
+  services: StackService[];
+  /** Anonymous stacks have a 24h TTL; authenticated stacks return empty. */
+  expires_in?: string;
+  /** Anonymous-tier CTA fields, same semantics as create_*. */
+  note?: string;
+  upgrade?: string;
+  upgrade_jwt?: string;
+}
+
+/**
+ * Caller-supplied params for create_stack — wraps POST /stacks/new.
+ *
+ * `manifest` is the raw YAML text of an `instant.yaml`. `service_tarballs`
+ * maps each service-name declared in the manifest to a base64-encoded gzip
+ * tarball of that service's build context (Dockerfile + sources). The client
+ * decodes each tarball and attaches it as a multipart file part NAMED AFTER
+ * THE SERVICE — this is the api's documented contract (see openapi.json
+ * StackRequest: "One field per service declared in the manifest, named after
+ * the service. Value is a gzipped tar archive."). Total request body cap is
+ * 200 MB across all services (api side); each service's decoded tarball is
+ * still capped at 50 MiB client-side.
+ */
+export interface CreateStackParams {
+  /** Stack name. Required (1-64 chars, ^[A-Za-z0-9][A-Za-z0-9 _-]*$). */
+  name: string;
+  /** instant.yaml text — declares services + their build/port/expose/needs. */
+  manifest: string;
+  /**
+   * One entry per service declared in the manifest. Keys are service names;
+   * values are base64-encoded gzip tarballs of that service's build context.
+   */
+  service_tarballs: Record<string, string>;
+  /**
+   * Optional resource env scope (development / staging / production). Default
+   * "development" server-side (see CLAUDE.md convention #11 / mig 026).
+   */
+  env?: string;
 }
 
 export interface ClaimResult {
@@ -606,9 +682,30 @@ export class InstantClient {
     return data as T;
   }
 
+  /**
+   * Build a `{ name [, env] }` body for the /<resource>/new endpoints.
+   *
+   * CLI-MCP FINDING-8: `env` is the resource environment scope (development /
+   * staging / production). The MCP previously dropped it entirely, so every
+   * call landed in the server-side default (`development` per mig 026 /
+   * CLAUDE.md convention #11) with no way for the agent to override. The
+   * helper only sets the field when the caller actually passed a non-empty
+   * string — undefined/empty preserves the server default and matches the
+   * pre-fix request shape exactly (so the wire diff is opt-in).
+   */
+  private provisionBody(name: string, env?: string): { name: string; env?: string } {
+    const body: { name: string; env?: string } = { name };
+    if (typeof env === "string" && env.length > 0) body.env = env;
+    return body;
+  }
+
   /** POST /db/new — provision a Postgres database. `name` is required. */
-  async createPostgres(name: string): Promise<DatabaseProvisionResult> {
-    return this.request<DatabaseProvisionResult>("POST", "/db/new", { name });
+  async createPostgres(name: string, env?: string): Promise<DatabaseProvisionResult> {
+    return this.request<DatabaseProvisionResult>(
+      "POST",
+      "/db/new",
+      this.provisionBody(name, env)
+    );
   }
 
   /**
@@ -616,40 +713,63 @@ export class InstantClient {
    * is required client-side for parity with the other create_* tools (the
    * server allows it to be omitted, but every other endpoint requires it).
    * Optional `dimensions` is a documentation hint only — pgvector picks
-   * dimensions per column at table-create time.
+   * dimensions per column at table-create time. Optional `env` lands the
+   * resource in a specific env bucket (server default `development`).
    */
   async createVector(
     name: string,
-    dimensions?: number
+    dimensions?: number,
+    env?: string
   ): Promise<VectorProvisionResult> {
-    const body: { name: string; dimensions?: number } = { name };
+    const body: { name: string; dimensions?: number; env?: string } =
+      this.provisionBody(name, env);
     if (typeof dimensions === "number") body.dimensions = dimensions;
     return this.request<VectorProvisionResult>("POST", "/vector/new", body);
   }
 
   /** POST /cache/new — provision a Redis cache. `name` is required. */
-  async createCache(name: string): Promise<CacheProvisionResult> {
-    return this.request<CacheProvisionResult>("POST", "/cache/new", { name });
+  async createCache(name: string, env?: string): Promise<CacheProvisionResult> {
+    return this.request<CacheProvisionResult>(
+      "POST",
+      "/cache/new",
+      this.provisionBody(name, env)
+    );
   }
 
   /** POST /nosql/new — provision a MongoDB database. `name` is required. */
-  async createNoSQL(name: string): Promise<NoSQLProvisionResult> {
-    return this.request<NoSQLProvisionResult>("POST", "/nosql/new", { name });
+  async createNoSQL(name: string, env?: string): Promise<NoSQLProvisionResult> {
+    return this.request<NoSQLProvisionResult>(
+      "POST",
+      "/nosql/new",
+      this.provisionBody(name, env)
+    );
   }
 
   /** POST /queue/new — provision a NATS JetStream queue. `name` is required. */
-  async createQueue(name: string): Promise<QueueProvisionResult> {
-    return this.request<QueueProvisionResult>("POST", "/queue/new", { name });
+  async createQueue(name: string, env?: string): Promise<QueueProvisionResult> {
+    return this.request<QueueProvisionResult>(
+      "POST",
+      "/queue/new",
+      this.provisionBody(name, env)
+    );
   }
 
   /** POST /storage/new — provision an S3-compatible object storage bucket prefix. `name` is required. */
-  async createStorage(name: string): Promise<StorageProvisionResult> {
-    return this.request<StorageProvisionResult>("POST", "/storage/new", { name });
+  async createStorage(name: string, env?: string): Promise<StorageProvisionResult> {
+    return this.request<StorageProvisionResult>(
+      "POST",
+      "/storage/new",
+      this.provisionBody(name, env)
+    );
   }
 
   /** POST /webhook/new — provision a webhook receiver. `name` is required. */
-  async createWebhook(name: string): Promise<WebhookProvisionResult> {
-    return this.request<WebhookProvisionResult>("POST", "/webhook/new", { name });
+  async createWebhook(name: string, env?: string): Promise<WebhookProvisionResult> {
+    return this.request<WebhookProvisionResult>(
+      "POST",
+      "/webhook/new",
+      this.provisionBody(name, env)
+    );
   }
 
   /**
@@ -842,6 +962,77 @@ export class InstantClient {
       upgrade_jwt: raw.upgrade_jwt,
       item: raw.item,
     };
+  }
+
+  /**
+   * POST /stacks/new — upload an instant.yaml manifest + one gzipped tarball
+   * per declared service and deploy a multi-service bundle. Multipart.
+   *
+   * Anonymous-friendly: like /deploy/new the api accepts anonymous callers
+   * (OptionalAuth — openapi.json:157), issuing the stack at the anonymous tier
+   * with a 24h TTL. This is the CEO wedge: a single MCP call from a cold-start
+   * agent → live bundle URL on *.deployment.instanode.dev, no card, no
+   * dashboard round-trip.
+   *
+   * Multipart shape (per StackRequest in openapi.json):
+   *   - `name`  — text field, required.
+   *   - `manifest` — text field carrying the YAML body.
+   *   - `<service-name>` — one binary file part PER service declared in the
+   *     manifest, named after the service (e.g. `api`, `web`, `worker`).
+   *   - `env` — optional text field (resource env scope).
+   *
+   * Returns the api's 202 StackResponse with stack_id, per-service status +
+   * URL (exposed services only), and anonymous-tier CTA fields.
+   */
+  async createStack(params: CreateStackParams): Promise<StackResult> {
+    const form = new FormData();
+
+    form.append("name", params.name);
+    form.append("manifest", params.manifest);
+    if (typeof params.env === "string" && params.env.length > 0) {
+      form.append("env", params.env);
+    }
+
+    // One file part per service. Enforce the per-tarball 50 MiB cap
+    // client-side, mirroring the create_deploy guard — an oversized tarball
+    // would otherwise stream multiple MB of base64 to the api just to be
+    // rejected, with the agent host potentially logging the body.
+    for (const [serviceName, b64] of Object.entries(params.service_tarballs)) {
+      const tarball = Buffer.from(b64, "base64");
+      if (tarball.byteLength > MAX_TARBALL_BYTES) {
+        throw new Error(
+          `Tarball for service "${serviceName}" is too large: ` +
+            `${tarball.byteLength.toLocaleString()} bytes (decoded). ` +
+            `The api accepts at most ${MAX_TARBALL_BYTES.toLocaleString()} ` +
+            `bytes (50 MiB) per service. Shrink the tarball: include only ` +
+            `what \`docker build\` needs — exclude node_modules, .git, build ` +
+            `artifacts, large media. Add a .dockerignore.`
+        );
+      }
+      const blob = new Blob([tarball], { type: "application/gzip" });
+      form.append(serviceName, blob, `${serviceName}.tar.gz`);
+    }
+
+    // /stacks/new is OptionalAuth — anonymous callers are accepted with a 24h
+    // TTL. Do NOT pass requireAuth here.
+    return this.requestMultipart<StackResult>("/stacks/new", form);
+  }
+
+  /**
+   * GET /stacks/{slug} — poll a stack's per-service status + URLs.
+   *
+   * The public `/stacks/{slug}` route mirrors the StackResponse shape returned
+   * by POST /stacks/new (services array, expires_in, etc.) — distinct from
+   * the dashboard-only `GET /api/v1/stacks/{slug}` which requires auth and
+   * returns a flatter summary. Anonymous callers polling a stack they just
+   * created use the public route, so this method is intentionally NOT
+   * requireAuth.
+   */
+  async getStack(stackId: string): Promise<StackResult> {
+    return this.request<StackResult>(
+      "GET",
+      `/stacks/${encodeURIComponent(stackId)}`
+    );
   }
 
   /** GET /api/v1/deployments — list deployments for the authenticated team. */

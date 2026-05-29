@@ -47,6 +47,27 @@ export interface MockDeployment {
   updated_at: string;
 }
 
+/** A stack the mock has "accepted" via POST /stacks/new. */
+export interface MockStackService {
+  name: string;
+  status: string;
+  port: number;
+  expose: boolean;
+  url: string;
+}
+
+export interface MockStack {
+  stack_id: string;
+  name: string;
+  tier: string;
+  env: string;
+  status: string;
+  services: MockStackService[];
+  created_at: string;
+  expires_at: string | null;
+  upgrade_jwt?: string;
+}
+
 /**
  * The bearer token the mock recognises as a valid paid-tier credential.
  * Any other Authorization value is treated as a bad token (401). Requests
@@ -83,10 +104,14 @@ export interface MockApiHandle {
   liveResources(): MockResource[];
   /** Every deployment the mock currently believes is live (not deleted). */
   liveDeployments(): MockDeployment[];
+  /** Every stack the mock currently believes is live (not deleted). */
+  liveStacks(): MockStack[];
   /** Total count of create_* calls received, for sanity assertions. */
   provisionCount(): number;
   /** Total count of /deploy/new calls received. */
   deployCount(): number;
+  /** Total count of /stacks/new calls received. */
+  stackCount(): number;
   /** Shut the server down. */
   close(): Promise<void>;
 }
@@ -94,8 +119,10 @@ export interface MockApiHandle {
 interface State {
   resources: Map<string, MockResource>;
   deployments: Map<string, MockDeployment>;
+  stacks: Map<string, MockStack>;
   provisionCalls: number;
   deployCalls: number;
+  stackCalls: number;
 }
 
 function nowIso(): string {
@@ -236,10 +263,11 @@ function provisionResponse(
 function parseMultipart(
   buf: Buffer,
   contentType: string
-): { hasTarball: boolean; fields: Record<string, string> } {
+): { hasTarball: boolean; fields: Record<string, string>; fileParts: string[] } {
   const m = /boundary=(.+)$/.exec(contentType);
   const fields: Record<string, string> = {};
-  if (!m) return { hasTarball: false, fields };
+  const fileParts: string[] = [];
+  if (!m) return { hasTarball: false, fields, fileParts };
   const boundary = `--${m[1]}`;
   const text = buf.toString("latin1");
   const parts = text.split(boundary).slice(1, -1);
@@ -252,13 +280,15 @@ function parseMultipart(
     const nameMatch = /name="([^"]+)"/.exec(headers);
     if (!nameMatch) continue;
     const fieldName = nameMatch[1];
-    if (fieldName === "tarball" || headers.includes("filename=")) {
+    const isFile = fieldName === "tarball" || headers.includes("filename=");
+    if (isFile) {
       hasTarball = true;
+      fileParts.push(fieldName);
     } else {
       fields[fieldName] = value;
     }
   }
-  return { hasTarball, fields };
+  return { hasTarball, fields, fileParts };
 }
 
 /**
@@ -268,8 +298,10 @@ export function startMockApi(): Promise<MockApiHandle> {
   const state: State = {
     resources: new Map(),
     deployments: new Map(),
+    stacks: new Map(),
     provisionCalls: 0,
     deployCalls: 0,
+    stackCalls: 0,
   };
 
   const server = createServer(async (req, res) => {
@@ -294,8 +326,11 @@ export function startMockApi(): Promise<MockApiHandle> {
           [...state.resources.values()].filter((r) => r.status !== "deleted"),
         liveDeployments: () =>
           [...state.deployments.values()].filter((d) => d.status !== "deleted"),
+        liveStacks: () =>
+          [...state.stacks.values()].filter((s) => s.status !== "deleted"),
         provisionCount: () => state.provisionCalls,
         deployCount: () => state.deployCalls,
+        stackCount: () => state.stackCalls,
         close: () =>
           new Promise<void>((closeResolve, closeReject) => {
             // Drop any keep-alive sockets so close() resolves promptly even
@@ -724,6 +759,197 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
       status: "deleted",
       message: "deployment torn down",
     });
+    return;
+  }
+
+  // ── POST /stacks/new (multipart, OptionalAuth) ─────────────────────────────
+  // Mirrors api/internal/handlers/stack.go:Create. The route is OptionalAuth
+  // (openapi.json:157) — anonymous callers land at the anonymous tier with
+  // a 24h TTL, authenticated callers inherit their team tier. The mock pins
+  // the live contract: every service declared under `services:` in the YAML
+  // manifest MUST have a matching multipart file part named after the
+  // service.
+  if (method === "POST" && path === "/stacks/new") {
+    const ct = req.headers["content-type"] ?? "";
+    const ctStr = Array.isArray(ct) ? ct[0] : ct;
+    if (!ctStr.startsWith("multipart/form-data")) {
+      sendJSON(
+        res,
+        400,
+        errorEnvelope({ error: "bad_request", message: "stacks/new expects multipart/form-data" })
+      );
+      return;
+    }
+    const raw = await readBody(req);
+    const { fields, fileParts } = parseMultipart(raw, ctStr);
+    const nameErr = validateName(fields["name"]);
+    if (nameErr) {
+      sendJSON(res, 400, errorEnvelope(nameErr));
+      return;
+    }
+    const manifest = fields["manifest"];
+    if (typeof manifest !== "string" || manifest.length === 0) {
+      sendJSON(
+        res,
+        400,
+        errorEnvelope({ error: "manifest_required", message: "manifest is required" })
+      );
+      return;
+    }
+
+    // Discover service names from the manifest. The mock only needs to know
+    // which services were declared so it can (a) assert that each has a
+    // matching file part and (b) emit per-service entries in the response.
+    // The api does a full YAML parse + dependency-graph build; the mock
+    // matches simple `  <service-name>:` indented lines under `services:`.
+    const declaredServices: { name: string; port: number; expose: boolean }[] = [];
+    const lines = manifest.split(/\r?\n/);
+    let inServices = false;
+    let current: { name: string; port: number; expose: boolean } | null = null;
+    for (const line of lines) {
+      if (/^services:\s*$/.test(line)) {
+        inServices = true;
+        continue;
+      }
+      if (inServices && /^[A-Za-z]/.test(line)) {
+        // Hit a new top-level key — services section ended.
+        inServices = false;
+        if (current) declaredServices.push(current);
+        current = null;
+        continue;
+      }
+      if (!inServices) continue;
+      const svcMatch = /^ {2}([A-Za-z0-9_-]+):/.exec(line);
+      if (svcMatch) {
+        if (current) declaredServices.push(current);
+        current = { name: svcMatch[1], port: 8080, expose: false };
+        continue;
+      }
+      if (current) {
+        const portMatch = /port:\s*(\d+)/.exec(line);
+        if (portMatch) current.port = Number(portMatch[1]);
+        if (/expose:\s*true/.test(line)) current.expose = true;
+      }
+    }
+    if (current) declaredServices.push(current);
+
+    if (declaredServices.length === 0) {
+      sendJSON(
+        res,
+        400,
+        errorEnvelope({
+          error: "invalid_manifest",
+          message: "manifest declares no services",
+        })
+      );
+      return;
+    }
+
+    // Every declared `build:`-style service must have a matching file part.
+    // The mock keeps this lenient — declaredServices includes inline-resource
+    // services like `postgres: { kind: postgres }` which the api would
+    // recognise as resources rather than build contexts. To keep the mock
+    // small, we accept any subset of file parts that covers the services
+    // whose name matches a fileParts entry, and require at least one match.
+    const matchedServices = declaredServices.filter((s) => fileParts.includes(s.name));
+    if (matchedServices.length === 0) {
+      sendJSON(
+        res,
+        400,
+        errorEnvelope({
+          error: "missing_service_tarball",
+          message: `no file part matched a declared service (declared: ${declaredServices.map((s) => s.name).join(",")}; file parts: ${fileParts.join(",") || "(none)"})`,
+        })
+      );
+      return;
+    }
+
+    const paid = auth === "valid" || auth === "pat";
+    const tier = paid ? "pro" : "anonymous";
+    const stackId = `stk-${randomUUID().slice(0, 8)}`;
+    const env = fields["env"] && fields["env"].length > 0 ? fields["env"] : "development";
+
+    const services: MockStackService[] = declaredServices.map((s) => ({
+      name: s.name,
+      status: "building",
+      port: s.port,
+      expose: s.expose,
+      url: "",
+    }));
+    const stack: MockStack = {
+      stack_id: stackId,
+      name: fields["name"] ?? "",
+      tier,
+      env,
+      status: "building",
+      services,
+      created_at: nowIso(),
+      expires_at: paid ? null : expiry24h(),
+      upgrade_jwt: paid ? undefined : "mock.upgrade.jwt",
+    };
+    state.stacks.set(stackId, stack);
+    state.stackCalls += 1;
+    const body: Record<string, unknown> = {
+      ok: true,
+      stack_id: stackId,
+      status: "building",
+      tier,
+      env,
+      name: stack.name,
+      services,
+      expires_in: paid ? "" : "24h",
+    };
+    if (!paid) {
+      body["note"] =
+        "Anonymous stack — expires in 24h. Claim it to keep it permanently.";
+      body["upgrade"] = "https://api.instanode.dev/start?t=mock.upgrade.jwt";
+      body["upgrade_jwt"] = "mock.upgrade.jwt";
+    }
+    sendJSON(res, 202, body);
+    return;
+  }
+
+  // ── GET /stacks/{slug} (public — no auth required) ─────────────────────────
+  // Mirrors the public StackResponse-returning route. Distinct from the
+  // dashboard-only GET /api/v1/stacks/{slug} (flatter summary, requires
+  // auth). Anonymous callers can poll their own stacks.
+  if (method === "GET" && /^\/stacks\/[^/]+$/.test(path)) {
+    const slug = decodeURIComponent(path.slice("/stacks/".length));
+    const stack = state.stacks.get(slug);
+    if (!stack || stack.status === "deleted") {
+      sendJSON(res, 404, errorEnvelope({ error: "not_found", message: "stack not found" }));
+      return;
+    }
+    // Simulate the build completing: once polled, flip building → healthy and
+    // hand out URLs for exposed services. The mock mirrors get_deployment's
+    // building→running auto-flip so the test harness can exercise the poll
+    // loop without sleeping.
+    if (stack.status === "building") {
+      stack.status = "healthy";
+      for (const svc of stack.services) {
+        svc.status = "healthy";
+        if (svc.expose) {
+          svc.url = `https://${stack.stack_id}-${svc.name}.deployment.instanode.dev`;
+        }
+      }
+    }
+    const paid = stack.tier !== "anonymous";
+    const body: Record<string, unknown> = {
+      ok: true,
+      stack_id: stack.stack_id,
+      status: stack.status,
+      tier: stack.tier,
+      env: stack.env,
+      name: stack.name,
+      services: stack.services,
+      expires_in: paid ? "" : "24h",
+    };
+    if (!paid && stack.upgrade_jwt) {
+      body["upgrade"] = `https://api.instanode.dev/start?t=${stack.upgrade_jwt}`;
+      body["upgrade_jwt"] = stack.upgrade_jwt;
+      body["note"] = "Anonymous stack — expires in 24h.";
+    }
+    sendJSON(res, 200, body);
     return;
   }
 
