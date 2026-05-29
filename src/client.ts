@@ -466,15 +466,43 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Validate that a base URL is well-formed and uses http(s). BUG-MCP-040:
+ * `INSTANODE_API_URL=javascript:alert(1)` would otherwise produce mysterious
+ * failures deep in fetch — refuse it up-front with a clear stderr message and
+ * fall back to the default. Same intent as the CLI's safeBrowserURL.
+ */
+export function validateBaseURL(raw: string): string | null {
+  if (!raw || !raw.trim()) return null;
+  let u: URL;
+  try {
+    u = new URL(raw.trim());
+  } catch {
+    return null;
+  }
+  const scheme = u.protocol.toLowerCase();
+  if (scheme !== "http:" && scheme !== "https:") return null;
+  if (!u.host) return null;
+  return raw.trim();
+}
+
 export class InstantClient {
   private readonly baseURL: string;
 
   constructor(opts: ClientOptions = {}) {
-    this.baseURL = (
-      opts.baseURL ??
-      process.env["INSTANODE_API_URL"] ??
-      DEFAULT_BASE_URL
-    ).replace(/\/$/, "");
+    const requested =
+      opts.baseURL ?? process.env["INSTANODE_API_URL"] ?? DEFAULT_BASE_URL;
+    const validated = validateBaseURL(requested);
+    if (validated === null && requested !== DEFAULT_BASE_URL) {
+      // Operator passed a bad URL via env / opts. Warn on stderr and fall
+      // back to the default rather than failing every subsequent call with
+      // an opaque fetch error.
+      process.stderr.write(
+        `instanode-mcp: refusing INSTANODE_API_URL=${JSON.stringify(requested)} ` +
+          `(must be http(s)://host). Falling back to ${DEFAULT_BASE_URL}.\n`
+      );
+    }
+    this.baseURL = (validated ?? DEFAULT_BASE_URL).replace(/\/$/, "");
   }
 
   /**
