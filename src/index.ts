@@ -220,13 +220,28 @@ const nameArg = {
 // field on every /<resource>/new body since mig 026) so the agent can confirm
 // which bucket the resource landed in. Omitting `env` keeps the existing
 // behavior (server-side default `development`).
+// BUG-MCP-003/010: the API enforces `env` against ^[a-z0-9-]{1,32}$
+// (see api/internal/handlers/env.go + the `invalid_env` 400 branch).
+// Pre-fix the MCP schema declared `env` as a bare `z.string()`, so a
+// hostile agent could send `env=HACKERLAND` or `env=<33-chars>` and the
+// validation failure only surfaced from the API (extra round trip +
+// confusing error path). Enforcing here matches the API regex one-shot
+// and surfaces a clean zod error to the calling agent. The regex is
+// kept in a single constant so the api/CLI/dashboard stay in lockstep.
+const ENV_REGEX = /^[a-z0-9-]{1,32}$/;
+const envSchema = z
+  .string()
+  .regex(
+    ENV_REGEX,
+    "env must match ^[a-z0-9-]{1,32}$ (lowercase letters, digits, dashes; 1-32 chars; e.g. development, staging, production)"
+  )
+  .optional()
+  .describe(
+    "Resource environment scope: 'development' (server default — see CLAUDE.md convention #11 / migration 026), 'staging', or 'production'. Format: ^[a-z0-9-]{1,32}$ — lowercase letters, digits, and dashes only. Omitting `env` lands the resource in 'development' (lowest stakes). The response echoes the resolved `env` so callers can confirm the bucket."
+  );
+
 const envArg = {
-  env: z
-    .string()
-    .optional()
-    .describe(
-      "Resource environment scope: 'development' (server default — see CLAUDE.md convention #11 / migration 026), 'staging', or 'production'. Omitting `env` lands the resource in 'development' (lowest stakes). The response echoes the resolved `env` so callers can confirm the bucket."
-    ),
+  env: envSchema,
 };
 
 // Convenience: every create_* tool that only needs name + optional env. Spread
@@ -928,11 +943,17 @@ Requires INSTANODE_TOKEN (anonymous tier cannot deploy).`,
       .max(65535)
       .optional()
       .describe("Container HTTP port. Default 8080."),
+    // BUG-MCP-003/010: enforce the api regex client-side so a bad env
+    // surfaces as a zod error rather than a confusing API 400 round-trip.
     env: z
       .string()
+      .regex(
+        ENV_REGEX,
+        "env must match ^[a-z0-9-]{1,32}$ (lowercase letters, digits, dashes; 1-32 chars)"
+      )
       .optional()
       .describe(
-        "Deploy environment scope: 'development' (default — see CLAUDE.md convention #11 / migration 026), 'staging', or 'production'. Omitting `env` lands the deploy in 'development' (lowest stakes), so accidental no-env deploys can't merge with prod state. Each scope has its own vault and env_vars."
+        "Deploy environment scope: 'development' (default — see CLAUDE.md convention #11 / migration 026), 'staging', or 'production'. Format: ^[a-z0-9-]{1,32}$. Omitting `env` lands the deploy in 'development' (lowest stakes), so accidental no-env deploys can't merge with prod state. Each scope has its own vault and env_vars."
       ),
     // Security hardening (audit 2026-05-29):
     //   Bound the number of env entries and the per-value byte length so a
@@ -1100,11 +1121,18 @@ plus the anonymous-tier upgrade fields.`,
       .describe(
         "Map of service-name → base64-encoded gzip tarball of that service's build context (Dockerfile + source). One entry per service declared in the manifest that has a `build:` field. Service names match ^[A-Za-z0-9][A-Za-z0-9 _-]*$ (1..64). Cap: 50 MiB per service after base64 decode; max 32 services per stack."
       ),
+    // BUG-MCP-003/010: enforce the api regex client-side; same regex as
+    // envSchema above. Kept inline rather than referencing envSchema so
+    // the create_stack input contract is grep-visible in one block.
     env: z
       .string()
+      .regex(
+        ENV_REGEX,
+        "env must match ^[a-z0-9-]{1,32}$ (lowercase letters, digits, dashes; 1-32 chars)"
+      )
       .optional()
       .describe(
-        "Resource environment scope: 'development' (server default — see CLAUDE.md convention #11 / migration 026), 'staging', or 'production'. Omitting `env` lands the stack in 'development' (lowest stakes). The response echoes the resolved `env`."
+        "Resource environment scope: 'development' (server default — see CLAUDE.md convention #11 / migration 026), 'staging', or 'production'. Format: ^[a-z0-9-]{1,32}$. Omitting `env` lands the stack in 'development' (lowest stakes). The response echoes the resolved `env`."
       ),
   },
   async ({ name, manifest, service_tarballs, env }) => {
