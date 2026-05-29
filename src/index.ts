@@ -55,7 +55,7 @@ import {
   type ProvisionLimits,
   type Resource,
 } from "./client.js";
-import { nameSchema } from "./name_schema.js";
+import { nameSchema, NAME_PATTERN } from "./name_schema.js";
 
 const client = new InstantClient();
 
@@ -934,17 +934,30 @@ Requires INSTANODE_TOKEN (anonymous tier cannot deploy).`,
       .describe(
         "Deploy environment scope: 'development' (default — see CLAUDE.md convention #11 / migration 026), 'staging', or 'production'. Omitting `env` lands the deploy in 'development' (lowest stakes), so accidental no-env deploys can't merge with prod state. Each scope has its own vault and env_vars."
       ),
+    // Security hardening (audit 2026-05-29):
+    //   Bound the number of env entries and the per-value byte length so a
+    //   hostile agent host can't blow the 50 MiB multipart cap with a
+    //   pathological env_vars / resource_bindings map. 256 keys + 8 KiB per
+    //   value matches a typical k8s env-var budget; the api will still
+    //   reject anything that exceeds its own envelope, but rejecting here
+    //   wastes no bandwidth and surfaces a precise error to the agent.
     env_vars: z
-      .record(z.string(), z.string())
+      .record(z.string().min(1).max(256), z.string().max(8 * 1024))
       .optional()
+      .refine((d) => !d || Object.keys(d).length <= 256, {
+        message: "env_vars: at most 256 entries",
+      })
       .describe(
-        "Env vars to inject into the container. Values may be plaintext or 'vault://env/KEY' refs (the API decrypts them at deploy time)."
+        "Env vars to inject into the container. Values may be plaintext or 'vault://env/KEY' refs (the API decrypts them at deploy time). Max 256 entries, 8 KiB per value."
       ),
     resource_bindings: z
-      .record(z.string(), z.string())
+      .record(z.string().min(1).max(256), z.string().max(8 * 1024))
       .optional()
+      .refine((d) => !d || Object.keys(d).length <= 256, {
+        message: "resource_bindings: at most 256 entries",
+      })
       .describe(
-        "Map of env var name → resource token UUID (e.g. { DATABASE_URL: '<postgres token>' }). The API resolves each token to its connection URL server-side. DO NOT pass raw connection URLs here — use create_postgres/create_cache/etc. to get tokens, then bind them."
+        "Map of env var name → resource token UUID (e.g. { DATABASE_URL: '<postgres token>' }). The API resolves each token to its connection URL server-side. DO NOT pass raw connection URLs here — use create_postgres/create_cache/etc. to get tokens, then bind them. Max 256 entries, 8 KiB per value."
       ),
     private: z
       .boolean()
@@ -1047,16 +1060,45 @@ status } (only exposed services get a public URL), expires_in (24h on anon),
 plus the anonymous-tier upgrade fields.`,
   {
     name: nameSchema,
+    // Security hardening (audit 2026-05-29):
+    //   Bound the manifest body and the number of services in the multipart
+    //   payload. A hostile agent host could otherwise stream an unbounded
+    //   YAML body to the api (which then has to parse it) or declare
+    //   thousands of services (each spawning a multipart part). Both lead to
+    //   server-side resource burn that wastes the 200 MB total-body budget
+    //   long before any tarball arrives. Cap the manifest at 256 KiB (the
+    //   server's own openapi bound) and cap service_tarballs at 32 services
+    //   — same ceiling the api documents for a stack. Service keys are also
+    //   constrained to the resource-name contract so the multipart wire
+    //   format and the manifest's `service://<name>` cross-refs cannot
+    //   diverge (control-byte / CRLF in keys is already percent-encoded by
+    //   undici, but a clean key contract avoids server-side surprises).
     manifest: z
       .string()
       .min(1)
+      .max(256 * 1024, {
+        message: "manifest must be at most 256 KiB",
+      })
       .describe(
-        "instant.yaml text. MUST declare a top-level `services:` map; each service entry takes build/port/expose/env/needs/kind fields. Cross-service refs use service://<name>. See the example in this tool's description."
+        "instant.yaml text. MUST declare a top-level `services:` map; each service entry takes build/port/expose/env/needs/kind fields. Cross-service refs use service://<name>. See the example in this tool's description. Max 256 KiB."
       ),
     service_tarballs: z
-      .record(z.string().min(1), z.string().min(1))
+      .record(
+        z
+          .string()
+          .min(1)
+          .max(64)
+          .regex(NAME_PATTERN, {
+            message:
+              "service name must start with a letter or digit, then letters/digits/spaces/underscores/hyphens (matches /^[A-Za-z0-9][A-Za-z0-9 _-]*$/)",
+          }),
+        z.string().min(1)
+      )
+      .refine((d) => Object.keys(d).length <= 32, {
+        message: "at most 32 services per stack",
+      })
       .describe(
-        "Map of service-name → base64-encoded gzip tarball of that service's build context (Dockerfile + source). One entry per service declared in the manifest that has a `build:` field. Cap: 50 MiB per service after base64 decode."
+        "Map of service-name → base64-encoded gzip tarball of that service's build context (Dockerfile + source). One entry per service declared in the manifest that has a `build:` field. Service names match ^[A-Za-z0-9][A-Za-z0-9 _-]*$ (1..64). Cap: 50 MiB per service after base64 decode; max 32 services per stack."
       ),
     env: z
       .string()
