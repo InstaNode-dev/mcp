@@ -1163,6 +1163,335 @@ describe("InstantClient — unit-level branch coverage", () => {
   });
 });
 
+describe("InstantClient — env passthrough on every /<resource>/new call (CLI-MCP FINDING-8)", () => {
+  beforeEach(() => {
+    delete process.env["INSTANODE_TOKEN"];
+    delete process.env["INSTANODE_API_URL"];
+  });
+  afterEach(() => {
+    restoreFetch();
+    delete process.env["INSTANODE_TOKEN"];
+  });
+
+  // One test per create_* method covers the new env forwarding path. The
+  // omitted-env path is already covered by the existing per-method tests
+  // above ("body.name === 'my-cache'") — they pass undefined for env and
+  // assert the wire body has only `{name}`. The cases below pin the
+  // affirmative branch: when env is supplied, it must appear on the wire.
+
+  it("createPostgres → forwards env when supplied", async () => {
+    let body: any = null;
+    stubFetch((_input: any, init?: any) => {
+      body = JSON.parse(init.body);
+      return new Response(
+        JSON.stringify({ ok: true, token: "t", id: "i", tier: "anonymous", connection_url: "postgres://x" }),
+        { status: 201, headers: { "content-type": "application/json" } }
+      );
+    });
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    await c.createPostgres("pg", "staging");
+    assert.equal(body.env, "staging");
+  });
+
+  it("createVector → forwards env alongside dimensions", async () => {
+    let body: any = null;
+    stubFetch((_input: any, init?: any) => {
+      body = JSON.parse(init.body);
+      return new Response(
+        JSON.stringify({ ok: true, token: "t", tier: "anonymous", connection_url: "postgres://x" }),
+        { status: 201, headers: { "content-type": "application/json" } }
+      );
+    });
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    await c.createVector("v", 1536, "production");
+    assert.equal(body.env, "production");
+    assert.equal(body.dimensions, 1536);
+  });
+
+  it("createCache → forwards env when supplied", async () => {
+    let body: any = null;
+    stubFetch((_input: any, init?: any) => {
+      body = JSON.parse(init.body);
+      return new Response(
+        JSON.stringify({ ok: true, token: "t", tier: "anonymous", connection_url: "redis://x" }),
+        { status: 201, headers: { "content-type": "application/json" } }
+      );
+    });
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    await c.createCache("rc", "staging");
+    assert.equal(body.env, "staging");
+  });
+
+  it("createNoSQL → forwards env when supplied", async () => {
+    let body: any = null;
+    stubFetch((_input: any, init?: any) => {
+      body = JSON.parse(init.body);
+      return new Response(
+        JSON.stringify({ ok: true, token: "t", tier: "anonymous", connection_url: "mongodb://x" }),
+        { status: 201, headers: { "content-type": "application/json" } }
+      );
+    });
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    await c.createNoSQL("mongo", "production");
+    assert.equal(body.env, "production");
+  });
+
+  it("createQueue → forwards env when supplied", async () => {
+    let body: any = null;
+    stubFetch((_input: any, init?: any) => {
+      body = JSON.parse(init.body);
+      return new Response(
+        JSON.stringify({ ok: true, token: "t", tier: "anonymous", connection_url: "nats://x" }),
+        { status: 201, headers: { "content-type": "application/json" } }
+      );
+    });
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    await c.createQueue("q", "staging");
+    assert.equal(body.env, "staging");
+  });
+
+  it("createStorage → forwards env when supplied", async () => {
+    let body: any = null;
+    stubFetch((_input: any, init?: any) => {
+      body = JSON.parse(init.body);
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          token: "t",
+          id: "i",
+          tier: "anonymous",
+          connection_url: "https://nyc3.digitaloceanspaces.com/instant-shared/p/",
+          endpoint: "https://nyc3.digitaloceanspaces.com",
+          access_key_id: "AK",
+          secret_access_key: "SK",
+          prefix: "p/",
+        }),
+        { status: 201, headers: { "content-type": "application/json" } }
+      );
+    });
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    await c.createStorage("st", "production");
+    assert.equal(body.env, "production");
+  });
+
+  it("createWebhook → forwards env when supplied", async () => {
+    let body: any = null;
+    stubFetch((_input: any, init?: any) => {
+      body = JSON.parse(init.body);
+      return new Response(
+        JSON.stringify({ ok: true, token: "t", tier: "anonymous", receive_url: "https://x/wh" }),
+        { status: 201, headers: { "content-type": "application/json" } }
+      );
+    });
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    await c.createWebhook("hk", "development");
+    assert.equal(body.env, "development");
+  });
+
+  it("createPostgres → empty-string env is treated as omitted (server default applies)", async () => {
+    // CLI-MCP FINDING-8 invariant: provisionBody only sets `env` when the
+    // caller passes a non-empty string. Empty / undefined keeps the wire
+    // body identical to the pre-fix shape, so the server-side default
+    // ('development', per mig 026) still applies.
+    let body: any = null;
+    stubFetch((_input: any, init?: any) => {
+      body = JSON.parse(init.body);
+      return new Response(
+        JSON.stringify({ ok: true, token: "t", id: "i", tier: "anonymous", connection_url: "postgres://x" }),
+        { status: 201, headers: { "content-type": "application/json" } }
+      );
+    });
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    await c.createPostgres("pg", "");
+    assert.equal("env" in body, false, "empty-string env must not appear on the wire");
+  });
+});
+
+describe("InstantClient — createStack / getStack (the CEO wedge)", () => {
+  beforeEach(() => {
+    delete process.env["INSTANODE_TOKEN"];
+    delete process.env["INSTANODE_API_URL"];
+  });
+  afterEach(() => {
+    restoreFetch();
+    delete process.env["INSTANODE_TOKEN"];
+  });
+
+  it("createStack → POSTs /stacks/new multipart with name + manifest + per-service file parts", async () => {
+    let captured: { url: string; method: string; ctype: string; bodyText: string } | null = null;
+    stubFetch(async (input: any, init?: any) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const headers = new Headers(init?.headers ?? {});
+      const ctype = headers.get("content-type") ?? "";
+      // Body is a FormData — read it back as a Buffer so we can assert
+      // the part shape.
+      const resp = new Response(init?.body);
+      const bodyText = (await resp.text()).toString();
+      captured = { url, method, ctype, bodyText };
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          stack_id: "stk-12345678",
+          status: "building",
+          tier: "anonymous",
+          env: "development",
+          name: "hw",
+          services: [
+            { name: "app", status: "building", port: 8080, expose: true, url: "" },
+          ],
+          expires_in: "24h",
+          note: "Anonymous stack — expires in 24h.",
+          upgrade: "https://api.instanode.dev/start?t=x",
+          upgrade_jwt: "x",
+        }),
+        { status: 202, headers: { "content-type": "application/json" } }
+      );
+    });
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    const tarballB64 = Buffer.from("FAKE-TAR-1").toString("base64");
+    const result = await c.createStack({
+      name: "hw",
+      manifest: "services:\n  app:\n    build: .\n    port: 8080\n    expose: true\n",
+      service_tarballs: { app: tarballB64 },
+      env: "development",
+    });
+    assert.equal(result.stack_id, "stk-12345678");
+    assert.equal(result.tier, "anonymous");
+    assert.match(captured!.url, /\/stacks\/new$/);
+    assert.equal(captured!.method, "POST");
+    // The fetch implementation in node fills in multipart boundaries; we just
+    // assert the body carried the manifest, the name, the service-name file
+    // part, and the env.
+    assert.match(captured!.bodyText, /name="manifest"/);
+    assert.match(captured!.bodyText, /name="name"/);
+    assert.match(captured!.bodyText, /name="app"/);
+    assert.match(captured!.bodyText, /name="env"/);
+    assert.match(captured!.bodyText, /development/);
+  });
+
+  it("createStack → omits env field when not supplied", async () => {
+    let bodyText = "";
+    stubFetch(async (_input: any, init?: any) => {
+      const resp = new Response(init?.body);
+      bodyText = await resp.text();
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          stack_id: "stk-abcdef12",
+          status: "building",
+          tier: "anonymous",
+          services: [],
+        }),
+        { status: 202, headers: { "content-type": "application/json" } }
+      );
+    });
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    await c.createStack({
+      name: "no-env",
+      manifest: "services:\n  app:\n    build: .\n",
+      service_tarballs: { app: Buffer.from("x").toString("base64") },
+    });
+    assert.equal(/name="env"/.test(bodyText), false, "env field must not be on the wire when omitted");
+  });
+
+  it("createStack → rejects an oversized service tarball CLIENT-SIDE", async () => {
+    stubFetch(() => {
+      throw new Error("fetch must not be called when client-side cap fires");
+    });
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    // 51 MiB > MAX_TARBALL_BYTES (50 MiB)
+    const huge = Buffer.alloc(51 * 1024 * 1024).toString("base64");
+    await assert.rejects(
+      c.createStack({
+        name: "too-big",
+        manifest: "services:\n  app:\n    build: .\n",
+        service_tarballs: { app: huge },
+      }),
+      /Tarball for service "app" is too large/
+    );
+  });
+
+  it("createStack → OptionalAuth: no INSTANODE_TOKEN required (anonymous succeeds)", async () => {
+    let hadAuth: string | null = null;
+    stubFetch((_input: any, init?: any) => {
+      const headers = new Headers(init?.headers ?? {});
+      hadAuth = headers.get("authorization");
+      return new Response(
+        JSON.stringify({ ok: true, stack_id: "stk-9", status: "building", tier: "anonymous", services: [] }),
+        { status: 202, headers: { "content-type": "application/json" } }
+      );
+    });
+    // No INSTANODE_TOKEN in env.
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    await c.createStack({
+      name: "anon",
+      manifest: "services:\n  app:\n    build: .\n",
+      service_tarballs: { app: Buffer.from("x").toString("base64") },
+    });
+    assert.equal(hadAuth, null, "anonymous createStack must not send Authorization");
+  });
+
+  it("getStack → GETs /stacks/{slug} and decodes the response", async () => {
+    let url = "";
+    let method = "";
+    stubFetch((input: any, init?: any) => {
+      url = String(input);
+      method = init?.method ?? "GET";
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          stack_id: "stk-99",
+          status: "healthy",
+          tier: "anonymous",
+          env: "development",
+          name: "hw",
+          services: [
+            { name: "app", status: "healthy", port: 8080, expose: true, url: "https://stk-99-app.deployment.instanode.dev" },
+          ],
+          expires_in: "24h",
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    });
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    const r = await c.getStack("stk-99");
+    assert.equal(method, "GET");
+    assert.match(url, /\/stacks\/stk-99$/);
+    assert.equal(r.status, "healthy");
+    assert.equal(r.services[0].url, "https://stk-99-app.deployment.instanode.dev");
+  });
+
+  it("getStack → URI-encodes the slug path segment", async () => {
+    let url = "";
+    stubFetch((input: any) => {
+      url = String(input);
+      return new Response(
+        JSON.stringify({ ok: true, stack_id: "x/y", status: "building", tier: "anonymous", services: [] }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    });
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    await c.getStack("x/y");
+    assert.match(url, /\/stacks\/x%2Fy$/);
+  });
+
+  it("getStack → 404 surfaces ApiError with the api's error envelope", async () => {
+    stubFetch(() =>
+      new Response(
+        JSON.stringify({ ok: false, error: "not_found", message: "stack not found" }),
+        { status: 404, headers: { "content-type": "application/json" } }
+      )
+    );
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    await assert.rejects(c.getStack("stk-missing"), (err: any) => {
+      assert.equal(err.status, 404);
+      assert.equal(err.code, "not_found");
+      return true;
+    });
+  });
+});
+
 describe("ApiError + AuthRequiredError shapes", () => {
   it("AuthRequiredError carries the canonical message + name", () => {
     const e = new AuthRequiredError();

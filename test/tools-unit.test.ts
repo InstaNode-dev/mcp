@@ -1361,3 +1361,208 @@ describe("tool handlers — optional-field absent branches", () => {
     assert.doesNotMatch(text, /Allowed IPs:/);
   });
 });
+
+// ── create_stack / get_stack handler branch coverage ────────────────────────
+//
+// Drive the create_stack + get_stack callbacks directly through stubbed
+// fetch responses to hit each `if (result.foo)` ternary and the urlPart
+// triple-branch (svc.url ? svc.expose ? cluster-internal). Goes after the
+// other handlers so the existing `before/after` mock-api harness still
+// applies — the stubbed fetch overrides per-test and is restored to the
+// mock by INSTANODE_API_URL pointing at the mock server.
+
+describe("tool handlers — create_stack / get_stack branch coverage", () => {
+  // Capture the suite-baseline fetch (mock-api-backed via INSTANODE_API_URL)
+  // so each test restores it after stubbing — keeps a later describe block
+  // from inheriting a leftover stub.
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    (globalThis as any).fetch = realFetch;
+  });
+
+  it("create_stack → minimal response (no env, no name, no expires_in, no services): every optional branch is skipped", async () => {
+    (globalThis as any).fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          ok: true,
+          stack_id: "stk-abc12345",
+          status: "building",
+          tier: "anonymous",
+        }),
+        { status: 202, headers: { "content-type": "application/json" } }
+      )) as typeof globalThis.fetch;
+    const res = await handlerFor("create_stack")({
+      name: "u-min-stack",
+      manifest: "services:\n  app:\n    build: .\n",
+      service_tarballs: { app: tarballBase64() },
+    });
+    const text = flat(res);
+    assert.match(text, /Stack accepted/);
+    assert.match(text, /Stack ID:\s+stk-abc12345/);
+    assert.match(text, /Tier:\s+anonymous/);
+    assert.doesNotMatch(text, /Environment:/);
+    assert.doesNotMatch(text, /Expires in:/);
+    assert.doesNotMatch(text, /Services \(/);
+  });
+
+  it("create_stack → response with name + env + services: ternary URL branches all render", async () => {
+    (globalThis as any).fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          ok: true,
+          stack_id: "stk-xyz98765",
+          status: "building",
+          tier: "anonymous",
+          env: "staging",
+          name: "u-full",
+          expires_in: "24h",
+          services: [
+            { name: "web", status: "healthy", port: 8080, expose: true, url: "https://stk-xyz98765-web.deployment.instanode.dev" },
+            { name: "api", status: "building", port: 9000, expose: true, url: "" },
+            { name: "worker", status: "building", port: 7000, expose: false, url: "" },
+          ],
+          note: "Anonymous stack — expires in 24h.",
+          upgrade: "https://api.instanode.dev/start?t=u-full",
+        }),
+        { status: 202, headers: { "content-type": "application/json" } }
+      )) as typeof globalThis.fetch;
+    const res = await handlerFor("create_stack")({
+      name: "u-full",
+      manifest: "services:\n  web:\n    build: .\n",
+      service_tarballs: { web: tarballBase64() },
+      env: "staging",
+    });
+    const text = flat(res);
+    // All three urlPart branches must render:
+    assert.match(text, /web.*→\s+https:\/\/stk-xyz98765-web\.deployment\.instanode\.dev/, "exposed-with-url branch");
+    assert.match(text, /api.*→\s+\(URL pending — poll get_stack\)/, "exposed-without-url branch");
+    assert.match(text, /worker.*\(cluster-internal http:\/\/worker:7000\)/, "non-exposed cluster-internal branch");
+    // Optional-field rendering:
+    assert.match(text, /Environment:\s+staging/);
+    assert.match(text, /Name:\s+u-full/);
+    assert.match(text, /Expires in:\s+24h/);
+    assert.match(text, /Services \(3\)/);
+    // Upgrade block surfaces note + claim URL via appendUpgradeBlock:
+    assert.match(text, /Anonymous stack/);
+    assert.match(text, /https:\/\/api\.instanode\.dev\/start\?t=u-full/);
+  });
+
+  it("create_stack → catch path runs formatError (network error)", async () => {
+    (globalThis as any).fetch = (async () => {
+      throw new TypeError("fetch failed");
+    }) as typeof globalThis.fetch;
+    const res = await handlerFor("create_stack")({
+      name: "u-net",
+      manifest: "services:\n  app:\n    build: .\n",
+      service_tarballs: { app: tarballBase64() },
+    });
+    const text = flat(res);
+    assert.match(text, /network error reaching instanode\.dev/);
+  });
+
+  it("get_stack → minimal envelope: every '??' fallback fires", async () => {
+    // Server returns {ok: true} only — every optional field is missing.
+    (globalThis as any).fetch = (async () =>
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as typeof globalThis.fetch;
+    const res = await handlerFor("get_stack")({ stack_id: "stk-fallback" });
+    const text = flat(res);
+    // stack_id falls back to the caller-supplied arg.
+    assert.match(text, /Stack stk-fallback/);
+    // status / tier fall back to "(unknown)".
+    assert.match(text, /Status:\s+\(unknown\)/);
+    assert.match(text, /Tier:\s+\(unknown\)/);
+    // No services block.
+    assert.doesNotMatch(text, /Services \(/);
+  });
+
+  it("get_stack → full envelope: env + name + expires_in + 3-branch urlPart render", async () => {
+    (globalThis as any).fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          ok: true,
+          stack_id: "stk-full",
+          status: "healthy",
+          tier: "anonymous",
+          env: "development",
+          name: "u-get-full",
+          expires_in: "24h",
+          services: [
+            { name: "web", status: "healthy", port: 8080, expose: true, url: "https://stk-full-web.deployment.instanode.dev" },
+            { name: "queue", status: "building", port: 4222, expose: true, url: "" },
+            { name: "worker", status: "healthy", port: 5000, expose: false, url: "" },
+          ],
+          upgrade: "https://api.instanode.dev/start?t=u-get-full",
+          note: "Anonymous stack.",
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      )) as typeof globalThis.fetch;
+    const res = await handlerFor("get_stack")({ stack_id: "stk-full" });
+    const text = flat(res);
+    assert.match(text, /Environment:\s+development/);
+    assert.match(text, /Name:\s+u-get-full/);
+    assert.match(text, /Expires in:\s+24h/);
+    assert.match(text, /Services \(3\)/);
+    assert.match(text, /web.*→\s+https:\/\/stk-full-web\.deployment/, "exposed-with-url");
+    assert.match(text, /queue.*→\s+\(URL pending\)/, "exposed-without-url");
+    assert.match(text, /worker.*\(cluster-internal http:\/\/worker:5000\)/, "non-exposed cluster-internal");
+    assert.match(text, /https:\/\/api\.instanode\.dev\/start\?t=u-get-full/);
+  });
+
+  it("get_stack → catch path runs formatError (404 → 'stack not found')", async () => {
+    (globalThis as any).fetch = (async () =>
+      new Response(
+        JSON.stringify({ ok: false, error: "not_found", message: "stack not found" }),
+        { status: 404, headers: { "content-type": "application/json" } }
+      )) as typeof globalThis.fetch;
+    const res = await handlerFor("get_stack")({ stack_id: "stk-missing" });
+    const text = flat(res);
+    assert.match(text, /404/);
+    assert.match(text, /stack not found/);
+  });
+});
+
+// ── env passthrough on the seven provisioning handlers (CLI-MCP FINDING-8) ──
+//
+// The integration suite proves the env field reaches the mock; this
+// handler-level set pins that the tool callback destructures `{ name, env }`
+// and forwards env to the client method on the SOURCE-LEVEL build (so the
+// dist-test/src/index.js coverage hits both branches of `{name, env}` —
+// the env-present and env-absent calls).
+
+describe("tool handlers — env passthrough on every provisioning tool (CLI-MCP FINDING-8)", () => {
+  // Ensure each test runs against the real (mock-api-backed) fetch even if a
+  // prior test in the suite stubbed it without restoring.
+  const realFetch = globalThis.fetch;
+  beforeEach(() => {
+    (globalThis as any).fetch = realFetch;
+  });
+
+  // Iterating per-tool name keeps the test compact and makes the per-handler
+  // line in dist-test/src/index.js (the `({ name, env }) =>` destructure +
+  // forward) run for every tool, not just the two we happened to spot-check
+  // earlier. Each call is a fresh hermetic mock-api request.
+  const tools = ["create_postgres", "create_cache", "create_nosql", "create_queue", "create_storage", "create_webhook"];
+  for (const tool of tools) {
+    it(`${tool} → handler forwards env="staging" to the api`, async () => {
+      process.env["INSTANODE_TOKEN"] = VALID_TOKEN;
+      const beforeCount = mock.provisionCount();
+      const res = await handlerFor(tool)({ name: `u-env-${tool.slice(7)}`, env: "staging" });
+      const text = flat(res);
+      // Each handler emits its provisioned-message banner; pinning the
+      // generic 'provisioned' substring keeps the assertion uniform.
+      assert.match(text, /provisioned\./);
+      assert.equal(mock.provisionCount(), beforeCount + 1);
+    });
+  }
+
+  it("create_vector → handler forwards env alongside dimensions to the api", async () => {
+    process.env["INSTANODE_TOKEN"] = VALID_TOKEN;
+    const beforeCount = mock.provisionCount();
+    const res = await handlerFor("create_vector")({ name: "u-env-vector", env: "staging", dimensions: 1536 });
+    assert.match(flat(res), /pgvector Postgres database provisioned\./);
+    assert.equal(mock.provisionCount(), beforeCount + 1);
+  });
+});
