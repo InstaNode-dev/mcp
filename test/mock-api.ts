@@ -264,7 +264,11 @@ function parseMultipart(
   buf: Buffer,
   contentType: string
 ): { hasTarball: boolean; fields: Record<string, string>; fileParts: string[] } {
-  const m = /boundary=(.+)$/.exec(contentType);
+  // CodeQL js/polynomial-redos: cap the capture group length so the regex
+  // can't backtrack on a giant adversarial Content-Type header. RFC 7578
+  // multipart boundaries are a 1-70 character token; 200 here is generous
+  // but bounded so the engine runs in O(n) rather than O(n^2).
+  const m = /boundary=([^;\s]{1,200})/.exec(contentType);
   const fields: Record<string, string> = {};
   const fileParts: string[] = [];
   if (!m) return { hasTarball: false, fields, fileParts };
