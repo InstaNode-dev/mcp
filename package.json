@@ -61,5 +61,8 @@
   "engines": {
     "node": ">=18"
   },
-  "mcpName": "io.github.InstaNode-dev/mcp"
+  "mcpName": "io.github.InstaNode-dev/mcp",
+  "overrides": {
+    "qs": "^6.15.2"
+  }
 }
