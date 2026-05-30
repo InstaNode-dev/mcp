@@ -272,7 +272,7 @@ describe("tool handlers — auth-gated paths surface the auth-required message",
   });
 
   it("redeploy → unauthenticated returns the canonical auth-required text", async () => {
-    const res = await handlerFor("redeploy")({ id: "dep" });
+    const res = await handlerFor("redeploy")({ id: "dep", tarball_base64: tarballBase64() });
     const text = flat(res);
     assert.match(text, /requires authentication/i);
   });
@@ -499,7 +499,7 @@ describe("tool handlers — deployment lifecycle", () => {
     });
     const appId = /Deploy ID:\s+(\S+)/.exec(flat(created))![1];
 
-    const re = await handlerFor("redeploy")({ id: appId });
+    const re = await handlerFor("redeploy")({ id: appId, tarball_base64: tarballBase64() });
     const text = flat(re);
     assert.match(text, /Redeploy accepted for/);
     assert.match(text, new RegExp(appId));
@@ -524,7 +524,10 @@ describe("tool handlers — deployment lifecycle", () => {
   });
 
   it("redeploy → 404 surfaces the formatError envelope", async () => {
-    const res = await handlerFor("redeploy")({ id: "app-does-not-exist" });
+    const res = await handlerFor("redeploy")({
+      id: "app-does-not-exist",
+      tarball_base64: tarballBase64(),
+    });
     const text = flat(res);
     assert.match(text, /instanode\.dev error \(404/);
   });
@@ -1047,7 +1050,7 @@ describe("tool handlers — optional-field absent branches", () => {
         status: 202,
         headers: { "content-type": "application/json" },
       })) as typeof globalThis.fetch;
-    const res = await handlerFor("redeploy")({ id: "fallback-id" });
+    const res = await handlerFor("redeploy")({ id: "fallback-id", tarball_base64: tarballBase64() });
     const text = flat(res);
     assert.match(text, /Redeploy accepted for fallback-id/);
     assert.match(text, /Status:\s+building/);
@@ -1060,7 +1063,7 @@ describe("tool handlers — optional-field absent branches", () => {
         JSON.stringify({ ok: true, id: "dep-m", status: "building", message: "queued for rebuild" }),
         { status: 202, headers: { "content-type": "application/json" } }
       )) as typeof globalThis.fetch;
-    const res = await handlerFor("redeploy")({ id: "dep-m" });
+    const res = await handlerFor("redeploy")({ id: "dep-m", tarball_base64: tarballBase64() });
     const text = flat(res);
     assert.match(text, /Message: queued for rebuild/);
   });
@@ -1567,5 +1570,82 @@ describe("tool handlers — env passthrough on every provisioning tool (CLI-MCP 
     const res = await handlerFor("create_vector")({ name: "u-env-vector", env: "staging", dimensions: 1536 });
     assert.match(flat(res), /pgvector Postgres database provisioned\./);
     assert.equal(mock.provisionCount(), beforeCount + 1);
+  });
+});
+
+describe("redeploy-in-place tool handlers (fix/mcp-redeploy-in-place)", () => {
+  it("create_deploy with redeploy:true + same name updates IN PLACE (same app_id)", async () => {
+    process.env["INSTANODE_TOKEN"] = VALID_TOKEN;
+    const created = await handlerFor("create_deploy")({
+      tarball_base64: tarballBase64(),
+      name: "u-inplace-app",
+    });
+    const firstAppId = /Deploy ID:\s+(\S+)/.exec(flat(created))![1];
+
+    const updated = await handlerFor("create_deploy")({
+      tarball_base64: tarballBase64(),
+      name: "u-inplace-app",
+      redeploy: true,
+    });
+    const secondAppId = /Deploy ID:\s+(\S+)/.exec(flat(updated))![1];
+
+    // Same app_id → same URL slot, no orphan deployment created.
+    assert.equal(secondAppId, firstAppId, "redeploy:true must reuse the existing app_id");
+
+    await handlerFor("delete_deployment")({ id: firstAppId });
+  });
+
+  it("create_deploy WITHOUT redeploy + same name mints a FRESH app_id (legacy behaviour)", async () => {
+    process.env["INSTANODE_TOKEN"] = VALID_TOKEN;
+    const created = await handlerFor("create_deploy")({
+      tarball_base64: tarballBase64(),
+      name: "u-legacy-app",
+    });
+    const firstAppId = /Deploy ID:\s+(\S+)/.exec(flat(created))![1];
+
+    const second = await handlerFor("create_deploy")({
+      tarball_base64: tarballBase64(),
+      name: "u-legacy-app",
+    });
+    const secondAppId = /Deploy ID:\s+(\S+)/.exec(flat(second))![1];
+
+    assert.notEqual(secondAppId, firstAppId, "omitting redeploy must mint a fresh app_id");
+
+    await handlerFor("delete_deployment")({ id: firstAppId });
+    await handlerFor("delete_deployment")({ id: secondAppId });
+  });
+
+  it("create_deploy with redeploy:true but NEW name falls through to create-new", async () => {
+    process.env["INSTANODE_TOKEN"] = VALID_TOKEN;
+    const created = await handlerFor("create_deploy")({
+      tarball_base64: tarballBase64(),
+      name: "u-new-with-redep-true",
+      redeploy: true,
+    });
+    const text = flat(created);
+    const appId = /Deploy ID:\s+(\S+)/.exec(text)![1];
+    assert.ok(appId.length > 0, "expected an app id even when no prior deployment exists");
+
+    await handlerFor("delete_deployment")({ id: appId });
+  });
+
+  it("standalone redeploy tool now requires tarball_base64 — sends multipart to /deploy/:id/redeploy", async () => {
+    process.env["INSTANODE_TOKEN"] = VALID_TOKEN;
+    const created = await handlerFor("create_deploy")({
+      tarball_base64: tarballBase64(),
+      name: "u-standalone-redep",
+    });
+    const appId = /Deploy ID:\s+(\S+)/.exec(flat(created))![1];
+
+    const re = await handlerFor("redeploy")({
+      id: appId,
+      tarball_base64: tarballBase64(),
+    });
+    const text = flat(re);
+    assert.match(text, /Redeploy accepted for/);
+    assert.match(text, new RegExp(appId));
+    assert.match(text, /Status:\s+building/);
+
+    await handlerFor("delete_deployment")({ id: appId });
   });
 });

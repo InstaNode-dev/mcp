@@ -314,6 +314,21 @@ export interface CreateDeployParams {
    * shape (e.g. `allowed_cidrs`), reconcile post-merge.
    */
   allowed_ips?: string[];
+  /**
+   * In-place redeploy flag (api PR feat/deploy-new-redeploy-in-place).
+   * When true AND `name` matches an existing deployment on the caller's team,
+   * the api updates that deployment IN PLACE (same app_id, same URL) instead
+   * of minting a fresh one. Default false → preserves the legacy "always mint
+   * a new app_id" behaviour. This closes the AGENT-UX gap where an agent
+   * shipping v2 of an existing app ended up with two live URLs.
+   *
+   * Forward compatibility: when sent against an api that doesn't yet
+   * understand the field, the multipart form value is silently ignored by
+   * Fiber's MultipartForm parser → behaves like the legacy path. Safe to
+   * ship from MCP before the api PR lands; the user only sees in-place
+   * redeploy behaviour once the api side is in prod.
+   */
+  redeploy?: boolean;
 }
 
 /**
@@ -956,6 +971,15 @@ export class InstantClient {
     if (params.allowed_ips && params.allowed_ips.length > 0) {
       form.append("allowed_ips", JSON.stringify(params.allowed_ips));
     }
+    // Redeploy-in-place opt-in (api PR feat/deploy-new-redeploy-in-place).
+    // Only forward when explicitly true — omitting the field keeps the api
+    // on the legacy "mint a new app_id" path, preserving existing behaviour
+    // for every caller that hasn't asked for in-place. Sending "false"
+    // would also work server-side, but omitting it makes the wire trace
+    // identical to pre-fix MCP versions for unaffected callers.
+    if (params.redeploy === true) {
+      form.append("redeploy", "true");
+    }
 
     // Merge resource_bindings into env_vars. The api treats every value
     // either as plaintext, a vault://env/KEY ref, or — for deploy bindings —
@@ -1083,20 +1107,47 @@ export class InstantClient {
   /**
    * POST /deploy/:id/redeploy — rebuild + rolling update an existing app.
    *
-   * The live API returns a bare 202 with no body (see openapi.json). Earlier
-   * versions of this client typed the response as DeployGetResult and the
-   * tool handler dereferenced `result.item.app_id`, throwing
-   * "Cannot read properties of undefined (reading 'app_id')" on every real
-   * call. BugBash B16 F1 (regression of task #170): the empty-body now
-   * resolves to `{ok: true}` via the request<T>() empty-2xx sentinel; this
+   * The api handler REQUIRES a fresh tarball multipart file part
+   * (deploy.go:1245 `missing_tarball`); there is no tarball reuse anywhere
+   * server-side. The previous bodyless version of this method always 400'd
+   * with "Multipart field 'tarball' is required" — see AGENT-UX.md Path B.
+   *
+   * `tarball_base64` is the same shape `createDeploy()` accepts: base64-
+   * encoded gzip tar (Dockerfile + source), capped at 50 MiB after decode.
+   * The 50 MiB ceiling is enforced client-side BEFORE the upload so an
+   * oversized payload fails fast with a clear error instead of round-
+   * tripping multiple MB of base64 to the api.
+   *
+   * The live api returns a bare 202 with no body (see openapi.json). The
+   * request<T>() empty-2xx sentinel resolves it to `{ok: true}`; this
    * helper layers the caller-supplied id on top so the tool handler has a
    * stable surface to read.
    */
-  async redeploy(id: string): Promise<RedeployResult> {
-    const raw = await this.request<RedeployResult>(
-      "POST",
+  async redeploy(id: string, tarballBase64: string): Promise<RedeployResult> {
+    const form = new FormData();
+
+    const tarball = Buffer.from(tarballBase64, "base64");
+
+    // Mirror the createDeploy guard — fail BEFORE opening a multipart
+    // connection on an oversized payload. The api enforces 50 MiB
+    // (deploy.go:1249 tarball_too_large); pre-empting it here surfaces a
+    // precise error and avoids bandwidth burn.
+    if (tarball.byteLength > MAX_TARBALL_BYTES) {
+      throw new Error(
+        `Tarball is too large: ${tarball.byteLength.toLocaleString()} bytes ` +
+          `(decoded). The api accepts at most ${MAX_TARBALL_BYTES.toLocaleString()} ` +
+          `bytes (50 MiB). Shrink the tarball: include only what \`docker build\` ` +
+          `needs — exclude node_modules, .git, build artifacts, large media files. ` +
+          `Add a .dockerignore to your project root.`
+      );
+    }
+
+    const blob = new Blob([tarball], { type: "application/gzip" });
+    form.append("tarball", blob, "app.tar.gz");
+
+    const raw = await this.requestMultipart<RedeployResult>(
       `/deploy/${encodeURIComponent(id)}/redeploy`,
-      undefined,
+      form,
       { requireAuth: true }
     );
     return {

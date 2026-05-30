@@ -680,8 +680,14 @@ describe("instanode-mcp integration suite", () => {
         const listed = await client.callTool({ name: "list_deployments", arguments: {} });
         assert.ok(resultText(listed).includes(appId), "deployment missing from list_deployments");
 
-        // redeploy — status flips back to building
-        const redeployed = await client.callTool({ name: "redeploy", arguments: { id: appId } });
+        // redeploy — status flips back to building. The fix that landed
+        // alongside this test now requires a tarball multipart on
+        // /deploy/:id/redeploy (mirroring the real api contract; the
+        // previous bodyless call always 400'd missing_tarball in prod).
+        const redeployed = await client.callTool({
+          name: "redeploy",
+          arguments: { id: appId, tarball_base64: fakeTarballBase64() },
+        });
         assert.ok(/Status:\s+building/.test(resultText(redeployed)), "redeploy did not reset status to building");
 
         // delete — MANDATORY teardown
@@ -715,9 +721,13 @@ describe("instanode-mcp integration suite", () => {
       const { client, close } = await connectClient(mock.url, "valid");
       try {
         // BUG-MCP-025: see above — UUID-shaped + unknown.
+        // tarball_base64 is now required (real api: deploy.go:1245).
         const res = await client.callTool({
           name: "redeploy",
-          arguments: { id: "00000000-0000-4000-8000-000000000404" },
+          arguments: {
+            id: "00000000-0000-4000-8000-000000000404",
+            tarball_base64: fakeTarballBase64(),
+          },
         });
         assert.ok(/404|not found/i.test(resultText(res)), "redeploy did not surface a 404");
       } finally {
@@ -864,7 +874,10 @@ describe("instanode-mcp integration suite", () => {
         // The act: redeploy must not throw, must include a clear "Redeploy
         // accepted" headline, and must NOT contain any sign of an undefined
         // dereference (the old failure mode).
-        const res = await client.callTool({ name: "redeploy", arguments: { id: appId } });
+        const res = await client.callTool({
+          name: "redeploy",
+          arguments: { id: appId, tarball_base64: fakeTarballBase64() },
+        });
         const text = resultText(res);
         assert.ok(text.includes("Redeploy accepted"), `expected a clean redeploy headline:\n${text}`);
         assert.ok(text.includes(appId), `expected the redeploy output to echo the id ${appId}:\n${text}`);
@@ -1090,6 +1103,10 @@ describe("instanode-mcp integration suite", () => {
     it("POST /deploy/:id/redeploy returns a bare 202 with no body (matches openapi.json)", async () => {
       // T17 P0-1: the prior mock returned {ok, item: deployment} on 202,
       // letting the broken redeploy client pass tests against fiction.
+      // fix/mcp-redeploy-in-place: the mock now also enforces the api's
+      // missing_tarball contract (deploy.go:1245), so this raw fetch must
+      // post multipart with a tarball file part to get the 202 — same
+      // shape as the real api.
       const { client, close } = await connectClient(mock.url, "valid");
       let appId = "";
       try {
@@ -1100,9 +1117,14 @@ describe("instanode-mcp integration suite", () => {
         appId = /Deploy ID:\s+(\S+)/.exec(resultText(created))![1];
 
         // Direct fetch — bypass the mcp client to inspect the raw response.
+        const form = new FormData();
+        const tarball = Buffer.from(fakeTarballBase64(), "base64");
+        const blob = new Blob([tarball], { type: "application/gzip" });
+        form.append("tarball", blob, "app.tar.gz");
         const resp = await fetch(`${mock.url}/deploy/${appId}/redeploy`, {
           method: "POST",
           headers: { Authorization: `Bearer ${VALID_TOKEN}` },
+          body: form,
         });
         assert.equal(resp.status, 202, `expected 202, got ${resp.status}`);
         const body = await resp.text();
@@ -1111,6 +1133,37 @@ describe("instanode-mcp integration suite", () => {
         await close();
       }
       // CLEANUP
+      const { client: c2, close: close2 } = await connectClient(mock.url, "valid");
+      try {
+        await c2.callTool({ name: "delete_deployment", arguments: { id: appId } });
+      } finally {
+        await close2();
+      }
+    });
+
+    it("POST /deploy/:id/redeploy WITHOUT a tarball returns 400 missing_tarball (real api contract)", async () => {
+      // fix/mcp-redeploy-in-place: mirror api/internal/handlers/deploy.go:1245
+      // — the prior mock accepted bodyless calls, masking the bug where
+      // the standalone redeploy MCP tool sent no tarball and always 400'd.
+      const { client, close } = await connectClient(mock.url, "valid");
+      let appId = "";
+      try {
+        const created = await client.callTool({
+          name: "create_deploy",
+          arguments: { tarball_base64: fakeTarballBase64(), name: "it-mock-missing-tar" },
+        });
+        appId = /Deploy ID:\s+(\S+)/.exec(resultText(created))![1];
+
+        const resp = await fetch(`${mock.url}/deploy/${appId}/redeploy`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${VALID_TOKEN}` },
+        });
+        assert.equal(resp.status, 400, `expected 400 missing_tarball, got ${resp.status}`);
+        const body = (await resp.json()) as { error?: string; message?: string };
+        assert.equal(body.error, "invalid_form", `unexpected error: ${JSON.stringify(body)}`);
+      } finally {
+        await close();
+      }
       const { client: c2, close: close2 } = await connectClient(mock.url, "valid");
       try {
         await c2.callTool({ name: "delete_deployment", arguments: { id: appId } });

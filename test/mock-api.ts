@@ -658,6 +658,40 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
       }
     }
 
+    // In-place redeploy support (api PR feat/deploy-new-redeploy-in-place):
+    // when the multipart form carries `redeploy=true` AND there is an
+    // existing deployment with the same `name` on the caller's team, the
+    // api updates that deployment IN PLACE — same app_id, same URL — and
+    // returns 202 with the existing item (status flipped back to building).
+    // The mock matches by name across all live deployments since it has
+    // no real team model.
+    const wantInPlace = fields["redeploy"] === "true";
+    const reqName = fields["name"] ?? "";
+    if (wantInPlace && reqName !== "") {
+      for (const existing of state.deployments.values()) {
+        if (existing.status === "deleted") continue;
+        // The mock stamps the user-supplied name into env["_name"] on
+        // create-new (see below) so subsequent redeploy-by-name lookups
+        // resolve without a separate team/name index. Real api uses the
+        // (team_id, name) primary key — the mock doesn't model teams.
+        if ((existing.env["_name"] ?? "") !== reqName) continue;
+        // Update in place — status flips to building, URL cleared until
+        // the next get_deployment poll flips it back to running.
+        existing.status = "building";
+        existing.url = "";
+        existing.env = { ...envVars, _name: reqName };
+        existing.updated_at = nowIso();
+        state.deployCalls += 1;
+        sendJSON(res, 202, {
+          ok: true,
+          item: existing,
+          note: "In-place redeploy started — poll get_deployment until status=running.",
+        });
+        return;
+      }
+      // Fall through to create-new when no existing deployment matches.
+    }
+
     // BUG-MCP-025: app_id is now validated as a UUID on the get/redeploy/
     // delete paths, matching the real API contract. The previous
     // `app-{shortid}` mock id silently passed because the schema was a
@@ -673,7 +707,7 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
       tier: effectiveTier,
       status: "building",
       url: "",
-      env: envVars,
+      env: { ...envVars, _name: reqName },
       environment: fields["env"] ?? "production",
       private: isPrivate,
       allowed_ips: allowedIps,
@@ -724,10 +758,12 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
   }
 
   // ── POST /deploy/:id/redeploy ──────────────────────────────────────────────
-  // Per openapi.json: bare 202 response, NO body schema. The previous mock returned
-  // {ok, item: deployment} — that masked a real prod bug where the MCP client typed
-  // the response as DeployGetResult and dereferenced .item.app_id, throwing on the
-  // empty-body 202 from the real API. T17 P0-1.
+  // Per the real api (deploy.go:1245 missing_tarball): /deploy/:id/redeploy
+  // REQUIRES a multipart `tarball` file part. The previous bodyless contract
+  // was a bug — the api always rejected with 400 missing_tarball in prod.
+  // The mock now enforces the real contract so the MCP client wiring
+  // (multipart upload from the standalone redeploy tool) is exercised end-
+  // to-end. Per openapi.json the response is a bare 202 with no body.
   if (method === "POST" && /^\/deploy\/[^/]+\/redeploy$/.test(path)) {
     if (!authed) {
       sendJSON(res, 401, errorEnvelope({ error: "unauthorized", message: "bearer token required" }));
@@ -737,6 +773,26 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
     const deployment = state.deployments.get(id);
     if (!deployment || deployment.status === "deleted") {
       sendJSON(res, 404, errorEnvelope({ error: "not_found", message: "deployment not found" }));
+      return;
+    }
+    const ct = req.headers["content-type"] ?? "";
+    const ctStr = Array.isArray(ct) ? ct[0] : ct;
+    if (!ctStr.startsWith("multipart/form-data")) {
+      sendJSON(
+        res,
+        400,
+        errorEnvelope({ error: "invalid_form", message: "Request must be multipart/form-data with a 'tarball' field" })
+      );
+      return;
+    }
+    const raw = await readBody(req);
+    const { hasTarball } = parseMultipart(raw, ctStr);
+    if (!hasTarball) {
+      sendJSON(
+        res,
+        400,
+        errorEnvelope({ error: "missing_tarball", message: "Multipart field 'tarball' is required" })
+      );
       return;
     }
     deployment.status = "building";
