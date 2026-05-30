@@ -777,17 +777,38 @@ a URL the user can click in their browser.`,
         // Not a URL — common case, leave jwt as-is.
       }
       const result = await client.claimToken(jwt, email);
-      const lines = [
-        `JWT claimed.`,
-        `Resource type: ${result.resource_type ?? "(see list_resources)"}`,
-        `Token:         ${result.token ?? "(see list_resources)"}`,
-        `Tier:          ${result.tier ?? "(see list_resources)"}`,
-        `Status:        ${result.status ?? "(see list_resources)"}`,
-        ``,
-        `Mint a bearer token via 'get_api_token' (after signing in once at the dashboard)`,
-        `to use the authenticated MCP tools (list_resources, delete_resource, etc.).`,
-      ];
-      if (result.name) lines.push(`Name: ${result.name}`);
+      // Live API contract (api/openapi.snapshot.json ClaimResponse, 2026-05-20):
+      // a successful claim returns {ok, team_id, user_id, session_token?,
+      // message?}. The previous renderer expected the retired direct-claim
+      // shape ({resource_type, token, tier, status, name}) and so showed
+      // "(see list_resources)" placeholders on every line of every successful
+      // claim — the agent learned NOTHING about what just happened and never
+      // surfaced the session_token the api hands back for immediate use.
+      const lines = [`Claim accepted for ${email}.`];
+      if (result.message) lines.push(`Message: ${result.message}`);
+      if (result.team_id) lines.push(`Team ID: ${result.team_id}`);
+      if (result.user_id) lines.push(`User ID: ${result.user_id}`);
+      if (result.session_token) {
+        lines.push(
+          ``,
+          `Session token (24h, ready to use):`,
+          `  ${result.session_token}`,
+          ``,
+          `Pass this as INSTANODE_TOKEN in your MCP env to call authenticated tools`,
+          `(list_resources, delete_resource, get_api_token, etc.) immediately. To rotate`,
+          `to a long-lived API key, sign in at https://instanode.dev/dashboard and call`,
+          `get_api_token (PATs cannot mint other PATs — see get_api_token docs).`
+        );
+      } else {
+        lines.push(
+          ``,
+          `Magic link sent to ${email}. The user must click the link in their inbox to`,
+          `finish signing in. After that, mint an API key in the dashboard (Settings → API`,
+          `Keys) and set it as INSTANODE_TOKEN to use authenticated MCP tools.`,
+          ``,
+          `Use list_resources (once authenticated) to confirm the resources transferred.`
+        );
+      }
       return textResult(lines.join("\n"));
     } catch (err) {
       return textResult(formatError(err));

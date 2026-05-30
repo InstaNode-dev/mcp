@@ -427,24 +427,33 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
   // Per openapi.json: returns 200 ClaimResponse {ok, team_id, user_id, session_token,
   // message} — the magic-link flow. The legacy 201 direct-claim shape (the old
   // {id, token, resource_type, tier, status} body) has been retired in the live API.
+  // Canonical request field is `token` (B5-P1, 2026-05-20); the legacy `jwt` alias
+  // is still accepted server-side for backward compatibility — `token` wins on
+  // collision. Mirror that here so we can verify MCP sends the canonical name.
   if (method === "POST" && path === "/claim") {
     const raw = await readBody(req);
-    let parsed: { jwt?: unknown; email?: unknown };
+    let parsed: { token?: unknown; jwt?: unknown; email?: unknown };
     try {
       parsed = raw.length > 0 ? JSON.parse(raw.toString("utf8")) : {};
     } catch {
       sendJSON(res, 400, errorEnvelope({ error: "bad_request", message: "malformed JSON body" }));
       return;
     }
-    if (typeof parsed.jwt !== "string" || parsed.jwt.length === 0) {
-      sendJSON(res, 400, errorEnvelope({ error: "bad_request", message: "jwt is required" }));
+    const tokField =
+      typeof parsed.token === "string" && parsed.token.length > 0
+        ? parsed.token
+        : typeof parsed.jwt === "string" && parsed.jwt.length > 0
+          ? parsed.jwt
+          : "";
+    if (tokField.length === 0) {
+      sendJSON(res, 400, errorEnvelope({ error: "missing_token", message: "token is required" }));
       return;
     }
     if (typeof parsed.email !== "string" || parsed.email.length === 0) {
       sendJSON(res, 400, errorEnvelope({ error: "bad_request", message: "email is required" }));
       return;
     }
-    if (parsed.jwt === "invalid.jwt") {
+    if (tokField === "invalid.jwt") {
       sendJSON(
         res,
         409,

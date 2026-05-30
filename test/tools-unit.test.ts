@@ -328,7 +328,13 @@ describe("tool handlers — claim helpers (pure, no network)", () => {
     const realFetch = globalThis.fetch;
     (globalThis as any).fetch = (async () =>
       new Response(
-        JSON.stringify({ ok: true, resource_type: "x", token: "t", tier: "free", status: "active" }),
+        JSON.stringify({
+          ok: true,
+          team_id: "t-1",
+          user_id: "u-1",
+          session_token: "sess.jwt",
+          message: "Magic link sent",
+        }),
         { status: 200, headers: { "content-type": "application/json" } }
       )) as typeof globalThis.fetch;
     try {
@@ -337,19 +343,28 @@ describe("tool handlers — claim helpers (pure, no network)", () => {
         email: "u@example.com",
       });
       const text = flat(res);
-      assert.match(text, /JWT claimed\./);
+      assert.match(text, /Claim accepted for u@example\.com\./);
     } finally {
       (globalThis as any).fetch = realFetch;
     }
   });
 
-  it("claim_token → raw JWT + email → JWT claimed; mock returns magic-link shape", async () => {
+  it("claim_token → raw JWT + email → renders team_id/user_id/session_token from live ClaimResponse shape", async () => {
     const res = await handlerFor("claim_token")({
       upgrade_jwt: "ey.valid.jwt",
       email: "u@example.com",
     });
     const text = flat(res);
-    assert.match(text, /JWT claimed\./);
+    assert.match(text, /Claim accepted for u@example\.com\./);
+    assert.match(text, /Team ID:/);
+    assert.match(text, /User ID:/);
+    // Mock-api returns a session_token, so the session-token block must
+    // render and the agent must be told how to use it as INSTANODE_TOKEN.
+    assert.match(text, /Session token \(24h, ready to use\):/);
+    assert.match(text, /INSTANODE_TOKEN/);
+    // Guard against the placeholder regression from before this fix —
+    // the previous renderer printed "(see list_resources)" on every line.
+    assert.doesNotMatch(text, /\(see list_resources\)/);
   });
 
   it("claim_token → URL-form upgrade_jwt extracted via URL parse branch", async () => {
@@ -358,7 +373,7 @@ describe("tool handlers — claim helpers (pure, no network)", () => {
       email: "u@example.com",
     });
     const text = flat(res);
-    assert.match(text, /JWT claimed\./);
+    assert.match(text, /Claim accepted for u@example\.com\./);
   });
 
   it("claim_token → already-claimed conflict surfaces the formatError envelope", async () => {
@@ -1092,7 +1107,11 @@ describe("tool handlers — optional-field absent branches", () => {
     assert.doesNotMatch(text, /Message:/);
   });
 
-  it("claim_token → result missing optional fields: fallbacks to '(see list_resources)' chain", async () => {
+  it("claim_token → bare {ok:true} body: renders the magic-link branch (no session_token, no Team ID lines)", async () => {
+    // The api's ClaimResponse shape post-2026-05-20 always carries team_id +
+    // user_id + message — but a defensive minimal {ok:true} body still has to
+    // render without throwing. We must NOT regress to the old placeholder
+    // "(see list_resources)" lines this fix removed.
     (globalThis as any).fetch = (async () =>
       new Response(JSON.stringify({ ok: true }), {
         status: 200,
@@ -1103,20 +1122,28 @@ describe("tool handlers — optional-field absent branches", () => {
       email: "u@example.com",
     });
     const text = flat(res);
-    assert.match(text, /JWT claimed\./);
-    assert.match(text, /\(see list_resources\)/);
+    assert.match(text, /Claim accepted for u@example\.com\./);
+    // No team_id / user_id / session_token / message in this body → none rendered.
+    assert.doesNotMatch(text, /Team ID:/);
+    assert.doesNotMatch(text, /User ID:/);
+    assert.doesNotMatch(text, /Session token/);
+    // Falls into the magic-link branch (no session_token returned).
+    assert.match(text, /Magic link sent to u@example\.com/);
+    // Critical regression guard: never re-introduce the retired placeholder
+    // text the old renderer printed for every missing field.
+    assert.doesNotMatch(text, /\(see list_resources\)/);
   });
 
-  it("claim_token → result with `name` field renders 'Name: ...' line", async () => {
+  it("claim_token → ClaimResponse with team_id + user_id + message but no session_token: renders all four lines + magic-link branch", async () => {
+    // Live magic-link envelope shape — what mock-api returns by default and
+    // what api/internal/handlers/onboarding.go currently emits.
     (globalThis as any).fetch = (async () =>
       new Response(
         JSON.stringify({
           ok: true,
-          resource_type: "postgres",
-          token: "t",
-          tier: "free",
-          status: "active",
-          name: "my-claimed-db",
+          team_id: "team-uuid",
+          user_id: "user-uuid",
+          message: "Magic link sent to email",
         }),
         { status: 200, headers: { "content-type": "application/json" } }
       )) as typeof globalThis.fetch;
@@ -1125,7 +1152,12 @@ describe("tool handlers — optional-field absent branches", () => {
       email: "u@example.com",
     });
     const text = flat(res);
-    assert.match(text, /Name: my-claimed-db/);
+    assert.match(text, /Team ID: team-uuid/);
+    assert.match(text, /User ID: user-uuid/);
+    assert.match(text, /Message: Magic link sent to email/);
+    // No session_token → magic-link guidance, NOT the immediate-use block.
+    assert.doesNotMatch(text, /Session token/);
+    assert.match(text, /Magic link sent to u@example\.com/);
   });
 
   it("create_deploy → response url is empty string: shows 'URL: (pending)'", async () => {

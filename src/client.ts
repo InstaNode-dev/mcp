@@ -402,14 +402,28 @@ export interface CreateStackParams {
   env?: string;
 }
 
+/**
+ * Response shape from POST /claim.
+ *
+ * Mirrors the live api's `ClaimResponse` schema (see
+ * api/openapi.snapshot.json ClaimResponse): `{ok, team_id, user_id,
+ * session_token?, message?}`. The legacy 201 direct-claim shape
+ * (`{id, token, resource_type, tier, status}`) was retired 2026-05-20 — every
+ * successful claim now goes through the magic-link flow and returns the
+ * magic-link envelope (see mcp/test/mock-api.ts:427-429). The previous MCP
+ * `ClaimResult` carried the retired fields verbatim, so `claim_token` rendered
+ * `(see list_resources)` placeholders for every line instead of telling the
+ * agent which team/user the claim landed against and (when present) handing
+ * back the 24h `session_token` the agent can use to call other tools
+ * immediately without a dashboard round-trip.
+ */
 export interface ClaimResult {
   ok: boolean;
-  id: string;
-  token: string;
-  resource_type: string;
-  name?: string;
-  tier: string;
-  status: string;
+  team_id?: string;
+  user_id?: string;
+  /** 24h session JWT — returned by the legacy direct-claim path only. */
+  session_token?: string;
+  message?: string;
 }
 
 export interface ApiTokenResult {
@@ -836,16 +850,22 @@ export class InstantClient {
   /**
    * POST /claim — convert an anonymous onboarding JWT into a claimed team.
    *
-   * Note: `/claim` requires {jwt, email} — it's the same flow the dashboard
-   * uses. There is no programmatic "claim a token to an existing team" route;
-   * the canonical claim primitive is identity-bound. Pass the upgrade_jwt
-   * returned by any anonymous provisioning response.
+   * Wire field name (B5-P1, 2026-05-20): the canonical request field is
+   * `token`. The api still accepts the legacy `jwt` alias for backward
+   * compatibility (dashboard, sdk-go, curl recipes) and prefers `token` when
+   * both are present — but the openapi ClaimRequest schema marks `jwt` as
+   * `deprecated: true`. New callers send `token`. We were previously the only
+   * surface still sending `jwt`-as-canonical, contributing to the three-name
+   * drift (jwt / token / INSTANODE_TOKEN) the api ClaimRequest doc calls out.
+   *
+   * Response: `{ok, team_id, user_id, session_token?, message?}` —
+   * NOT the retired 201 direct-claim shape. See the ClaimResult interface.
    */
   async claimToken(jwt: string, email: string): Promise<ClaimResult> {
     return this.request<ClaimResult>(
       "POST",
       "/claim",
-      { jwt, email },
+      { token: jwt, email },
       { requireAuth: false }
     );
   }
