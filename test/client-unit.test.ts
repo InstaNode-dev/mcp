@@ -604,7 +604,13 @@ describe("InstantClient — unit-level branch coverage", () => {
     assert.deepEqual(items, []);
   });
 
-  it("claimToken → POSTs /claim with {jwt, email} (no auth required)", async () => {
+  it("claimToken → POSTs /claim with canonical {token, email} (no auth required)", async () => {
+    // B5-P1 contract (api/openapi.snapshot.json ClaimRequest, 2026-05-20):
+    // the canonical wire field is `token`; the legacy `jwt` alias is marked
+    // deprecated in the openapi schema. The MCP previously sent `jwt` —
+    // still accepted server-side, but it was the last named drift source
+    // (dashboard + sdk-go migrated, MCP lagged). This test pins the wire
+    // body to the new shape so any future revert is caught.
     let body: any = null;
     let url = "";
     stubFetch((input: any, init?: any) => {
@@ -613,11 +619,10 @@ describe("InstantClient — unit-level branch coverage", () => {
       return new Response(
         JSON.stringify({
           ok: true,
-          id: "i",
-          token: "t",
-          resource_type: "postgres",
-          tier: "free",
-          status: "active",
+          team_id: "1f2e3d4c-5b6a-7980-91a2-b3c4d5e6f708",
+          user_id: "01020304-0506-0708-0900-010203040506",
+          session_token: "session.jwt.value",
+          message: "Magic link sent to email",
         }),
         { status: 200, headers: { "content-type": "application/json" } }
       );
@@ -626,8 +631,9 @@ describe("InstantClient — unit-level branch coverage", () => {
     const c = new InstantClient({ baseURL: "https://example.test" });
     const r = await c.claimToken("the-jwt", "u@example.com");
     assert.match(url, /\/claim$/);
-    assert.deepEqual(body, { jwt: "the-jwt", email: "u@example.com" });
-    assert.equal(r.tier, "free");
+    assert.deepEqual(body, { token: "the-jwt", email: "u@example.com" });
+    assert.equal(r.session_token, "session.jwt.value");
+    assert.equal(r.team_id, "1f2e3d4c-5b6a-7980-91a2-b3c4d5e6f708");
   });
 
   it("listDeployments → returns the {ok,items,total} envelope verbatim", async () => {

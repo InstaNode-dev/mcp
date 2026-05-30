@@ -565,7 +565,22 @@ describe("instanode-mcp integration suite", () => {
           name: "claim_token",
           arguments: { upgrade_jwt: "ey.valid.jwt", email: "dev@example.com" },
         });
-        assert.ok(resultText(res).includes("JWT claimed."), `expected a successful claim:\n${resultText(res)}`);
+        const text = resultText(res);
+        assert.ok(
+          text.includes("Claim accepted for dev@example.com."),
+          `expected a successful claim:\n${text}`
+        );
+        // Live ClaimResponse shape (api/openapi.snapshot.json) carries
+        // team_id + user_id; the mock returns a session_token too, which
+        // the renderer must surface so the agent can use it immediately
+        // as INSTANODE_TOKEN. Regression guard against the "(see
+        // list_resources)" placeholder text the old renderer printed.
+        assert.ok(text.includes("Team ID:"), `expected Team ID line:\n${text}`);
+        assert.ok(text.includes("Session token"), `expected session token block:\n${text}`);
+        assert.ok(
+          !text.includes("(see list_resources)"),
+          `must not regress to retired placeholder text:\n${text}`
+        );
       } finally {
         await close();
       }
