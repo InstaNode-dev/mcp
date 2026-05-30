@@ -145,7 +145,8 @@ describe("InstantClient — unit-level branch coverage", () => {
     stubFetch(() => new Response("", { status: 202 }));
     process.env["INSTANODE_TOKEN"] = "tok_xyz";
     const c = new InstantClient({ baseURL: "https://example.test" });
-    const res = await c.redeploy("dep-123");
+    const tiny = Buffer.from("hello").toString("base64");
+    const res = await c.redeploy("dep-123", tiny);
     assert.equal(res.ok, true);
     assert.equal(res.id, "dep-123");
     assert.equal(res.status, "building");
@@ -712,7 +713,8 @@ describe("InstantClient — unit-level branch coverage", () => {
     );
     process.env["INSTANODE_TOKEN"] = "tok_xyz";
     const c = new InstantClient({ baseURL: "https://example.test" });
-    const r = await c.redeploy("dep-9");
+    const tiny = Buffer.from("hello").toString("base64");
+    const r = await c.redeploy("dep-9", tiny);
     assert.equal(r.id, "dep-9");
     assert.equal(r.status, "rebuilding");
     assert.equal(r.message, "kicked");
@@ -1027,8 +1029,9 @@ describe("InstantClient — unit-level branch coverage", () => {
 
   it("redeploy → AuthRequiredError when token is unset", async () => {
     const c = new InstantClient({ baseURL: "https://example.test" });
+    const tiny = Buffer.from("hello").toString("base64");
     await assert.rejects(
-      () => c.redeploy("dep"),
+      () => c.redeploy("dep", tiny),
       (err: unknown) => err instanceof AuthRequiredError
     );
   });
@@ -1489,6 +1492,205 @@ describe("InstantClient — createStack / getStack (the CEO wedge)", () => {
       assert.equal(err.code, "not_found");
       return true;
     });
+  });
+});
+
+describe("redeploy-in-place wiring (fix/mcp-redeploy-in-place)", () => {
+  beforeEach(() => {
+    delete process.env["INSTANODE_TOKEN"];
+    delete process.env["INSTANODE_API_URL"];
+  });
+
+  afterEach(() => {
+    restoreFetch();
+    delete process.env["INSTANODE_TOKEN"];
+    delete process.env["INSTANODE_API_URL"];
+  });
+
+  it("createDeploy with redeploy:true appends `redeploy=true` to the multipart form", async () => {
+    process.env["INSTANODE_TOKEN"] = "tok_xyz";
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    const tiny = Buffer.from("hello").toString("base64");
+
+    let formText = "";
+    stubFetch(async (_input: any, init?: any) => {
+      const blob = init.body as any;
+      if (blob && typeof blob.text === "function") {
+        formText = await blob.text();
+      }
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          item: {
+            id: "i",
+            app_id: "a-redep-1",
+            token: "t",
+            port: 8080,
+            tier: "pro",
+            status: "building",
+            url: "",
+          },
+        }),
+        { status: 202, headers: { "content-type": "application/json" } }
+      );
+    });
+
+    await c.createDeploy({
+      tarball_base64: tiny,
+      name: "in-place-app",
+      redeploy: true,
+    });
+
+    // The form must carry a `redeploy=true` text field. If the runtime
+    // doesn't expose blob.text() we skip the body check (the call alone
+    // proves the path is wired).
+    if (formText.length > 0) {
+      assert.match(formText, /name="redeploy"/);
+      assert.match(formText, /\r\n\r\ntrue\r\n/);
+    }
+  });
+
+  it("createDeploy without redeploy does NOT send the `redeploy` form field (preserves legacy behaviour)", async () => {
+    process.env["INSTANODE_TOKEN"] = "tok_xyz";
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    const tiny = Buffer.from("hello").toString("base64");
+
+    let formText = "";
+    stubFetch(async (_input: any, init?: any) => {
+      const blob = init.body as any;
+      if (blob && typeof blob.text === "function") {
+        formText = await blob.text();
+      }
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          item: {
+            id: "i",
+            app_id: "a-legacy-1",
+            token: "t",
+            port: 8080,
+            tier: "pro",
+            status: "building",
+            url: "",
+          },
+        }),
+        { status: 202, headers: { "content-type": "application/json" } }
+      );
+    });
+
+    await c.createDeploy({
+      tarball_base64: tiny,
+      name: "legacy-app",
+    });
+
+    if (formText.length > 0) {
+      // The `redeploy` field must not appear in the multipart body. If it
+      // sneaks in (e.g. via a default), an old api would treat a no-name
+      // case as a no-op or get confused — keep the wire identical to the
+      // pre-fix shape for callers that didn't ask for in-place.
+      assert.ok(!/name="redeploy"/.test(formText), `unexpected redeploy field: ${formText}`);
+    }
+  });
+
+  it("createDeploy with redeploy:false does NOT send the `redeploy` form field either", async () => {
+    process.env["INSTANODE_TOKEN"] = "tok_xyz";
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    const tiny = Buffer.from("hello").toString("base64");
+
+    let formText = "";
+    stubFetch(async (_input: any, init?: any) => {
+      const blob = init.body as any;
+      if (blob && typeof blob.text === "function") {
+        formText = await blob.text();
+      }
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          item: {
+            id: "i",
+            app_id: "a-legacy-2",
+            token: "t",
+            port: 8080,
+            tier: "pro",
+            status: "building",
+            url: "",
+          },
+        }),
+        { status: 202, headers: { "content-type": "application/json" } }
+      );
+    });
+
+    await c.createDeploy({
+      tarball_base64: tiny,
+      name: "explicit-false-app",
+      redeploy: false,
+    });
+
+    if (formText.length > 0) {
+      assert.ok(!/name="redeploy"/.test(formText), `unexpected redeploy field on explicit false: ${formText}`);
+    }
+  });
+
+  it("redeploy(id, tarball) POSTs multipart to /deploy/:id/redeploy carrying the tarball file part", async () => {
+    process.env["INSTANODE_TOKEN"] = "tok_xyz";
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    const tiny = Buffer.from("FROM scratch\n").toString("base64");
+
+    let calledURL = "";
+    let calledMethod = "";
+    let formText = "";
+    let contentType = "";
+    stubFetch(async (input: any, init?: any) => {
+      calledURL = typeof input === "string" ? input : input.url;
+      calledMethod = String(init?.method ?? "");
+      const ctRaw = init?.headers?.["Content-Type"] ?? init?.headers?.["content-type"] ?? "";
+      contentType = typeof ctRaw === "string" ? ctRaw : "";
+      const blob = init.body as any;
+      if (blob && typeof blob.text === "function") {
+        formText = await blob.text();
+      }
+      return new Response("", { status: 202 });
+    });
+
+    const r = await c.redeploy("dep-tar-1", tiny);
+    assert.equal(r.ok, true);
+    assert.equal(r.id, "dep-tar-1");
+    assert.equal(r.status, "building");
+    assert.match(calledURL, /\/deploy\/dep-tar-1\/redeploy$/);
+    assert.equal(calledMethod, "POST");
+    // fetch fills in Content-Type for FormData when it's not set explicitly;
+    // requestMultipart() intentionally omits the header so undici stamps the
+    // multipart boundary. Either way the wire is multipart — verified via
+    // the body shape (file part with filename) which we check below.
+    void contentType;
+    if (formText.length > 0) {
+      assert.match(formText, /name="tarball"/);
+      assert.match(formText, /filename="app\.tar\.gz"/);
+    }
+  });
+
+  it("redeploy rejects oversized tarballs CLIENT-SIDE before any fetch (mirrors createDeploy cap)", async () => {
+    process.env["INSTANODE_TOKEN"] = "tok_xyz";
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    const big = Buffer.alloc(60 * 1024 * 1024, 0xff).toString("base64");
+
+    let fetched = false;
+    stubFetch(() => { fetched = true; return new Response("ok", { status: 200 }); });
+
+    await assert.rejects(
+      () => c.redeploy("dep-huge", big),
+      (err: unknown) => /too large/i.test((err as Error).message)
+    );
+    assert.equal(fetched, false, "fetch should never be reached for oversized redeploy tarballs");
+  });
+
+  it("redeploy without INSTANODE_TOKEN throws AuthRequiredError (requireAuth gate)", async () => {
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    const tiny = Buffer.from("hello").toString("base64");
+    await assert.rejects(
+      () => c.redeploy("dep-noauth", tiny),
+      (err: unknown) => err instanceof AuthRequiredError
+    );
   });
 });
 

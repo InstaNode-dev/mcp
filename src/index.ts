@@ -12,7 +12,9 @@
  *   create_storage     — provision an S3-compatible object storage bucket prefix
  *   create_webhook     — provision an inbound webhook receiver URL
  *   create_deploy      — upload a base64 gzip tarball (Dockerfile + source) and
- *                        deploy a container; returns a public URL in ~30s
+ *                        deploy a container; returns a public URL in ~30s.
+ *                        Pass `redeploy: true` with the same name to update an
+ *                        existing deployment IN PLACE (same app_id + URL).
  *
  *   claim_resource     — turn an anonymous upgrade JWT into the dashboard claim URL
  *                        the agent should direct the user to (no API call — pure helper)
@@ -25,7 +27,10 @@
  *
  *   list_deployments   — list all deployments for the caller's team
  *   get_deployment     — fetch a deployment by app id (for polling build status)
- *   redeploy           — trigger a rebuild + rolling update of an existing app
+ *   redeploy           — push updated code to an existing deployment by id;
+ *                        requires a fresh tarball (api never reuses the original).
+ *                        Prefer `create_deploy({name, redeploy:true})` when you
+ *                        have the name; use this when you only have the deploy id.
  *   delete_deployment  — tear down a running deployment
  *
  * Every create_* tool surfaces the API's `note` and `upgrade` fields so the
@@ -940,7 +945,7 @@ agent can route the user to the dashboard instead of guessing.`,
 
 server.tool(
   "create_deploy",
-  `Create a new deploy. Optionally set \`private: true\` + \`allowed_ips: ['1.2.3.4', '10.0.0.0/8']\` to restrict access to specific IPs. Requires Pro tier or higher. Useful when an agent is asked to deploy a CRM, internal dashboard, or staging app that should only be reachable by the user.
+  `Create a new deploy — OR set \`redeploy: true\` to update an existing deployment with the same name (preserves app_id + URL). Optionally set \`private: true\` + \`allowed_ips: ['1.2.3.4', '10.0.0.0/8']\` to restrict access to specific IPs. Requires Pro tier or higher. Useful when an agent is asked to deploy a CRM, internal dashboard, or staging app that should only be reachable by the user.
 
 Deploys a containerized application on instanode.dev (POST /deploy/new).
 
@@ -949,6 +954,13 @@ Dockerfile at the root), passes it as 'tarball_base64', and the API builds +
 deploys + returns a public URL in ~30s. Build is asynchronous: the initial
 response carries status="building"; poll 'get_deployment' with the returned
 'deploy_id' until status becomes "running" or "failed".
+
+In-place update (redeploy:true): when you ship v2 of an existing app, pass
+the SAME 'name' plus 'redeploy: true'. The api updates that deployment in
+place — same app_id, same *.deployment.instanode.dev URL — instead of
+minting a fresh one. Default behaviour (redeploy omitted or false) always
+creates a new deployment and a new URL. This closes the AGENT-UX trap where
+shipping v2 with the same name left two live deployments + two URLs.
 
 Tarball construction (agent side, runtime depends on language):
   tar = subprocess.check_output(["tar", "czf", "-", "-C", project_dir, "."])
@@ -1065,6 +1077,20 @@ Requires INSTANODE_TOKEN (anonymous tier cannot deploy).`,
       .optional()
       .describe(
         "IP / CIDR allowlist enforced at the Ingress when 'private' is true. Examples: ['1.2.3.4', '10.0.0.0/8', '203.0.113.42/32']. Required when private=true; ignored otherwise. Max 256 entries; each must parse as IPv4/IPv6 address or CIDR."
+      ),
+    // In-place redeploy opt-in (api PR feat/deploy-new-redeploy-in-place).
+    // Sent to the api as a multipart form field — when true, the api looks
+    // up an existing deployment by (team_id, name) and updates it in place
+    // (same app_id, same URL) instead of minting a fresh one. Default false
+    // preserves the existing "always create a new deployment" behaviour.
+    // Note: the api PR must be in prod before this flag does anything; on
+    // an older api the field is silently ignored by Fiber's form parser
+    // (caller sees legacy behaviour, no error).
+    redeploy: z
+      .boolean()
+      .optional()
+      .describe(
+        "Set true to update an existing deployment with the same name (preserves app_id + URL). Default false → creates a new deployment with a fresh app_id and URL. Use redeploy:true when shipping a new version of an app you've already deployed."
       ),
   },
   // BUG-MCP-021: enforce the documented private+allowed_ips coupling
@@ -1442,20 +1468,43 @@ Requires INSTANODE_TOKEN.`,
 
 server.tool(
   "redeploy",
-  `Trigger a rebuild + rolling update of an existing deployment
-(POST /deploy/:id/redeploy). Useful after updating env vars via the
-dashboard, rotating a vault secret, or when the underlying image needs
-a refresh. The tarball from the original deploy is reused.
+  `Push updated code to an existing deployment by app id. Same URL, new build
+(POST /deploy/:id/redeploy).
+
+Use this when you already know the deploy_id and want to ship a code change
+without touching the URL or app_id. For the more common "I have the name, I
+want to update the app I just shipped" path, prefer
+create_deploy({ name, tarball_base64, redeploy: true }) — that resolves the
+deployment by name and is the AGENT-UX-recommended path.
+
+The api REQUIRES a fresh tarball — there is no server-side tarball reuse
+(the earlier tool description claiming reuse was wrong and caused every
+real call to fail with 400 missing_tarball). Pass a base64-encoded gzip
+tar of the project (Dockerfile + source), same shape as create_deploy.
 
 Status flips back to "building"; poll get_deployment until it returns
-to "running".
+to "running" (~30s typical).
 
 Requires INSTANODE_TOKEN.`,
   {
     // BUG-MCP-025: validate UUID client-side.
     id: uuidSchema.describe("Deployment app id (returned as 'deploy_id' by create_deploy)."),
+    // T-redeploy-fix: tarball is required. The api handler at
+    // deploy.go:1245 returns 400 missing_tarball without it; the previous
+    // tool schema omitted this field and the description lied about
+    // tarball reuse, making every real call 400.
+    tarball_base64: z
+      .string()
+      .min(1)
+      .max(
+        70 * 1024 * 1024,
+        "tarball_base64: encoded payload exceeds 70 MiB (≈50 MiB decoded). Shrink the tarball — strip .git, node_modules, build artifacts."
+      )
+      .describe(
+        "Base64-encoded gzip tarball of the project directory (must include a Dockerfile at the root). <50 MB after decode (≈70 MiB encoded). Same shape as create_deploy.tarball_base64."
+      ),
   },
-  async ({ id }) => {
+  async ({ id, tarball_base64 }) => {
     try {
       // BugBash B16 F1 (regression of task #170): /deploy/:id/redeploy returns
       // a bare 202 with no body — the previous handler dereferenced
@@ -1463,7 +1512,7 @@ Requires INSTANODE_TOKEN.`,
       // undefined (reading 'app_id')". client.redeploy() now resolves to
       // {ok, id, status, message} with safe fallbacks so the handler stays
       // alive even when the body is empty.
-      const result = await client.redeploy(id);
+      const result = await client.redeploy(id, tarball_base64);
       const appId = result.id ?? id;
       const lines = [
         `Redeploy accepted for ${appId}.`,

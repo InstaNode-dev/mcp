@@ -119,12 +119,12 @@ to reach for this MCP, see <https://instanode.dev/agent.html>.
 | `create_queue`    | `POST /queue/new` — Provision a NATS JetStream queue (scoped subject namespace). Returns `connection_url` + `note`/`upgrade`. `name` required.                    |
 | `create_storage`  | `POST /storage/new` — Provision an S3-compatible bucket prefix (DigitalOcean Spaces). Returns endpoint, access keys, prefix + `note`/`upgrade`. `name` required.  |
 | `create_webhook`  | `POST /webhook/new` — Provision an inbound webhook receiver URL. Returns `receive_url` + `note`/`upgrade`. `name` required.                                       |
-| `create_deploy`   | `POST /deploy/new` — Upload a base64 gzip tarball (with Dockerfile) and deploy a container. Returns `deploy_id`, `status`, `url`, `build_logs_url`. `name` required. Requires `INSTANODE_TOKEN`. |
+| `create_deploy`   | `POST /deploy/new` — Upload a base64 gzip tarball (with Dockerfile) and deploy a container. Returns `deploy_id`, `status`, `url`, `build_logs_url`. `name` required. Pass `redeploy: true` (with the SAME `name`) to update an existing deployment IN PLACE (same app_id + URL). Requires `INSTANODE_TOKEN`. |
 | `create_stack`    | `POST /stacks/new` — Multi-service bundle. Upload an `instant.yaml` manifest plus one base64 gzip tarball per service; returns `stack_id`, per-service URLs, and the 24h-TTL claim block on the anonymous tier. **Anonymous-friendly** (the wedge). `name`, `manifest`, `service_tarballs` required. |
 | `get_stack`       | `GET /stacks/{stack_id}` — Poll a stack's per-service status + URLs. Anonymous-friendly. `stack_id` required.                                                     |
 | `list_deployments`| `GET /api/v1/deployments` — List all deployments on the caller's team. Requires `INSTANODE_TOKEN`.                                                                |
 | `get_deployment`  | `GET /api/v1/deployments/:id` — Fetch one deployment (poll until `status="running"`). Requires `INSTANODE_TOKEN`.                                                 |
-| `redeploy`        | `POST /deploy/:id/redeploy` — Rebuild + rolling update an existing deployment. Requires `INSTANODE_TOKEN`.                                                        |
+| `redeploy`        | `POST /deploy/:id/redeploy` — Push updated code to an existing deployment BY ID. Same URL, new build. Requires `tarball_base64` (same shape as `create_deploy`) — the api never reuses the original tarball. For the more common "update by name" path prefer `create_deploy({ name, redeploy: true, tarball_base64 })`. Requires `INSTANODE_TOKEN`. |
 | `delete_deployment` | `DELETE /deploy/:id` — Tear down a running deployment. Irreversible. Requires `INSTANODE_TOKEN`.                                                                |
 | `claim_resource`  | Helper — turn an `upgrade_jwt` from any `create_*` response into the dashboard claim URL the user should click. No API call. No auth required.                    |
 | `claim_token`     | `POST /claim` — Programmatic claim: attach an anonymous resource to the authenticated account using its `upgrade_jwt` + `email`. No auth required.                |
@@ -185,6 +185,35 @@ params, which the agent host may log.
 `create_deploy` returns `status="building"` immediately. Poll
 `get_deployment({ id: deploy_id })` every few seconds until status flips to
 `"running"` (typical: ~30s). At that point the `url` field is the live URL.
+
+### Updating an existing deployment (same URL, new build)
+
+To ship v2 of an app you already deployed without changing the URL or
+`app_id`, call `create_deploy` again with the **same `name`** plus
+`redeploy: true`:
+
+```json
+{
+  "tarball_base64": "...",
+  "name": "my-app",
+  "redeploy": true
+}
+```
+
+The api finds the existing deployment by `(team_id, name)` and updates it
+in place — same `app_id`, same `*.deployment.instanode.dev` URL, status
+flips back to `building` while the new image rolls out.
+
+Without `redeploy: true`, calling `create_deploy` with a name you've used
+before mints a **new** `app_id` and a **new** URL (the legacy behaviour).
+This is the trap that caused the AGENT-UX issue where agents ended up
+with two live deployments + two URLs for the same app.
+
+The standalone `redeploy` tool (by `id`, not `name`) still works and also
+requires a `tarball_base64` — the api never reuses the original tarball.
+Prefer the `create_deploy({ name, redeploy: true })` path when you have
+the name; use `redeploy({ id, tarball_base64 })` when you only have the
+deploy id.
 
 ### Private deploys
 
