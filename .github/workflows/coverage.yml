@@ -58,6 +58,8 @@ jobs:
             dist-test/test/client-unit.test.js \
             dist-test/test/index-unit.test.js \
             dist-test/test/tools-unit.test.js \
+            dist-test/test/tool-coverage.test.js \
+            dist-test/test/tool-contract.test.js \
             dist-test/test/env-regex-unit.test.js \
             dist-test/test/input-hardening-unit.test.js
       - uses: actions/setup-python@v6
