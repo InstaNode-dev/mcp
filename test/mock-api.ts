@@ -95,6 +95,22 @@ export const BAD_TOKEN = "test-bearer-revoked";
  */
 export const PAT_TOKEN = "test-bearer-pat-pro-tier";
 
+/**
+ * A valid bearer token whose plan tier is "hobby".
+ *
+ * Used to exercise the agent-facing tier-gate (402) error mapping END-TO-END
+ * through a real MCP tool call. The hobby plan cannot create private deploys
+ * (private deploys require Pro+), so a `create_deploy` with `private: true`
+ * authenticated as HOBBY_TOKEN returns 402 `tier_upgrade_required` carrying an
+ * `agent_action` + `upgrade_url`. Before this fixture the only way the mock
+ * produced that 402 was an `x-mock-tier: hobby` request header the real
+ * InstantClient never sends — so the agent_action surfacing path was unreachable
+ * through an actual tool invocation. Keying it off the bearer makes the 402 path
+ * reachable the same way prod reaches it (the api derives tier from the team
+ * behind the token).
+ */
+export const HOBBY_TOKEN = "test-bearer-hobby-tier";
+
 export interface MockApiHandle {
   /** Base URL the MCP server should be pointed at (INSTANODE_API_URL). */
   url: string;
@@ -149,7 +165,7 @@ function sendJSON(res: ServerResponse, status: number, payload: unknown): void {
 }
 
 /** Classify the inbound Authorization header. */
-type AuthState = "anonymous" | "valid" | "pat" | "bad";
+type AuthState = "anonymous" | "valid" | "pat" | "hobby" | "bad";
 function classifyAuth(req: IncomingMessage): AuthState {
   const h = req.headers["authorization"];
   if (!h) return "anonymous";
@@ -157,6 +173,7 @@ function classifyAuth(req: IncomingMessage): AuthState {
   if (!m) return "bad";
   if (m[1] === VALID_TOKEN) return "valid";
   if (m[1] === PAT_TOKEN) return "pat";
+  if (m[1] === HOBBY_TOKEN) return "hobby";
   return "bad";
 }
 
@@ -218,8 +235,8 @@ function provisionResponse(
 ): Record<string, unknown> {
   const id = randomUUID();
   const token = randomUUID();
-  const paid = auth === "valid" || auth === "pat";
-  const tier = paid ? "pro" : "anonymous";
+  const paid = auth === "valid" || auth === "pat" || auth === "hobby";
+  const tier = paid ? (auth === "hobby" ? "hobby" : "pro") : "anonymous";
   const resource: MockResource = {
     id,
     token,
@@ -418,10 +435,11 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
     return;
   }
 
-  // Any authenticated session — covers session JWTs *and* PATs. The /api/v1/auth/api-keys
-  // route is the one exception (it requires a session, not a PAT) and handles that
-  // distinction in its own branch below.
-  const authed = auth === "valid" || auth === "pat";
+  // Any authenticated session — covers session JWTs *and* PATs (any plan tier,
+  // including the hobby fixture). The /api/v1/auth/api-keys route is the one
+  // exception (it requires a session, not a PAT) and handles that distinction in
+  // its own branch below.
+  const authed = auth === "valid" || auth === "pat" || auth === "hobby";
 
   // ── POST /claim ────────────────────────────────────────────────────────────
   // Per openapi.json: returns 200 ClaimResponse {ok, team_id, user_id, session_token,
@@ -617,10 +635,16 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
     }
 
     const isPrivate = fields["private"] === "true";
-    // The mock treats the valid token as Pro tier, so private deploys are
-    // allowed. A dedicated test flips this via the x-mock-tier override below.
+    // Tier resolution order:
+    //   1. explicit `x-mock-tier` request header (legacy test override), else
+    //   2. the tier behind the bearer — HOBBY_TOKEN → "hobby", any other valid
+    //      paid token → "pro". This makes the private-deploy 402 reachable via a
+    //      real `create_deploy({private:true})` call authenticated as HOBBY_TOKEN
+    //      (the InstantClient never sends `x-mock-tier`), mirroring how prod
+    //      derives the tier from the team behind the token.
     const tierOverride = req.headers["x-mock-tier"];
-    const effectiveTier = (Array.isArray(tierOverride) ? tierOverride[0] : tierOverride) ?? "pro";
+    const headerTier = Array.isArray(tierOverride) ? tierOverride[0] : tierOverride;
+    const effectiveTier = headerTier ?? (auth === "hobby" ? "hobby" : "pro");
     if (isPrivate && effectiveTier === "hobby") {
       sendJSON(
         res,
@@ -938,8 +962,8 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
       return;
     }
 
-    const paid = auth === "valid" || auth === "pat";
-    const tier = paid ? "pro" : "anonymous";
+    const paid = auth === "valid" || auth === "pat" || auth === "hobby";
+    const tier = paid ? (auth === "hobby" ? "hobby" : "pro") : "anonymous";
     const stackId = `stk-${randomUUID().slice(0, 8)}`;
     const env = fields["env"] && fields["env"].length > 0 ? fields["env"] : "development";
 
