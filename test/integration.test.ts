@@ -1505,6 +1505,74 @@ describe("instanode-mcp integration suite", () => {
         await close();
       }
     });
+
+    // BUGHUNT-iter2: the strict-≥80%-margin tier redesign (2026-06-05) retired
+    // every "unlimited" (-1) limit. Team's redis cap is now a finite 1536 MB
+    // (api/plans.yaml). The description used to say "team unlimited" — a stale
+    // claim an agent would relay to a user as a false promise. Guard the
+    // honest finite number AND assert the word "unlimited" never reappears.
+    it("create_cache description shows team's finite 1536 MB cap, never 'unlimited'", async () => {
+      const { client, close } = await connectClient(mock.url, "none");
+      try {
+        const { tools } = await client.listTools();
+        const cache = tools.find((t) => t.name === "create_cache")!;
+        const desc = cache.description ?? "";
+        assert.match(desc, /team 1536 MB/i, "expected the finite team cap 'team 1536 MB' in create_cache description");
+        assert.doesNotMatch(desc, /unlimited/i, "create_cache description must not advertise an 'unlimited' tier (strict-80 redesign retired all -1 limits)");
+      } finally {
+        await close();
+      }
+    });
+  });
+
+  // ── BUGHUNT-iter2: nosql + deploy description honesty ───────────────────────
+
+  describe("BUGHUNT-iter2 — create_nosql description honesty", () => {
+    // Pre-fix the description said "hobby 100 MB / pro 2 GB / team unlimited" —
+    // pro was wrong (plans.yaml mongodb_storage_mb pro = 5120 MB = 5 GB, not 2 GB)
+    // and team is no longer unlimited (strict-80: 40960 MB = 40 GB).
+    it("create_nosql description quotes the live plans.yaml mongodb numbers (5 GB pro, finite team)", async () => {
+      const { client, close } = await connectClient(mock.url, "none");
+      try {
+        const { tools } = await client.listTools();
+        const nosql = tools.find((t) => t.name === "create_nosql")!;
+        const desc = nosql.description ?? "";
+        assert.match(desc, /hobby 100 MB/i, "expected hobby 100 MB in create_nosql description");
+        assert.match(desc, /pro 5 GB/i, "expected pro 5 GB (5120 MB) in create_nosql description — pre-fix wrongly said 2 GB");
+        assert.match(desc, /team 40 GB/i, "expected the finite team cap 'team 40 GB' in create_nosql description");
+        assert.doesNotMatch(desc, /unlimited/i, "create_nosql description must not advertise an 'unlimited' tier (strict-80 redesign retired all -1 limits)");
+      } finally {
+        await close();
+      }
+    });
+  });
+
+  describe("BUGHUNT-iter2 — create_deploy tier-gate honesty", () => {
+    // Pre-fix the opening line said "Requires Pro tier or higher", conflating
+    // the base-deploy gate with the PRIVATE-deploy gate. Hobby CAN deploy
+    // (plans.yaml deployments_apps: hobby=1). An agent reading the old copy
+    // would wrongly refuse a legitimate Hobby deployment. The fix states the
+    // base gate is Hobby+ while keeping the Pro requirement for private deploys.
+    it("create_deploy description says Hobby can deploy and reserves Pro for private deploys", async () => {
+      const { client, close } = await connectClient(mock.url, "none");
+      try {
+        const { tools } = await client.listTools();
+        const deploy = tools.find((t) => t.name === "create_deploy")!;
+        const desc = deploy.description ?? "";
+        // Base deploy gate is Hobby+, not Pro+.
+        assert.match(desc, /Hobby tier or higher/i, "create_deploy must state the base deploy gate is Hobby tier or higher");
+        // The Pro mention must survive (private deploys genuinely need Pro+).
+        assert.match(desc, /pro tier/i, "create_deploy must still mention the Pro gate (for private deploys)");
+        // It must NOT claim Pro is required to deploy at all.
+        assert.doesNotMatch(
+          desc,
+          /restrict access to specific IPs\. Requires Pro tier or higher\./i,
+          "create_deploy must not claim a blanket 'Requires Pro tier or higher' base gate — Hobby can deploy",
+        );
+      } finally {
+        await close();
+      }
+    });
   });
 });
 

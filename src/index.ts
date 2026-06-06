@@ -443,7 +443,7 @@ Drop in as REDIS_URL with any Redis client (ioredis, node-redis, go-redis, etc.)
 Without INSTANODE_TOKEN: anonymous tier — 5 MB, 24h TTL. The response carries
 'note' + 'upgrade' (claim URL) — surface both verbatim.
 With INSTANODE_TOKEN (paid): hobby 50 MB / hobby_plus 50 MB / pro 512 MB /
-growth 1024 MB / team unlimited (per api/plans.yaml), permanent.
+growth 1024 MB / team 1536 MB (per api/plans.yaml), permanent.
 
 Cleanup: anonymous resources auto-expire after 24h — there is no on-demand
 delete for anonymous tokens, by design. On a paid tier, call
@@ -487,7 +487,8 @@ mongodb driver (mongoose, pymongo, etc.).
 
 Without INSTANODE_TOKEN: anonymous tier — 5 MB, 2 connections, 24h TTL.
 'note' + 'upgrade' fields in the response surface the claim URL.
-With INSTANODE_TOKEN (paid): hobby 100 MB / pro 2 GB / team unlimited, permanent.
+With INSTANODE_TOKEN (paid): hobby 100 MB / hobby_plus 1 GB / pro 5 GB /
+growth 20 GB / team 40 GB (per api/plans.yaml), permanent.
 
 Cleanup: anonymous resources auto-expire after 24h — there is no on-demand
 delete for anonymous tokens, by design. On a paid tier, call
@@ -966,7 +967,7 @@ agent can route the user to the dashboard instead of guessing.`,
 
 server.tool(
   "create_deploy",
-  `Create a new deploy — OR set \`redeploy: true\` to update an existing deployment with the same name (preserves app_id + URL). Optionally set \`private: true\` + \`allowed_ips: ['1.2.3.4', '10.0.0.0/8']\` to restrict access to specific IPs. Requires Pro tier or higher. Useful when an agent is asked to deploy a CRM, internal dashboard, or staging app that should only be reachable by the user.
+  `Create a new deploy — OR set \`redeploy: true\` to update an existing deployment with the same name (preserves app_id + URL). Optionally set \`private: true\` + \`allowed_ips: ['1.2.3.4', '10.0.0.0/8']\` to restrict access to specific IPs. Deploying requires a paid plan: Hobby tier or higher (Hobby = 1 app, Hobby Plus = 2, Pro = 10, Growth = 50, Team = 100 — per api/plans.yaml deployments_apps); anonymous and free tiers cannot deploy and get HTTP 402. The PRIVATE-deploy option (private: true + allowed_ips) additionally requires Pro tier or higher. Useful when an agent is asked to deploy a CRM, internal dashboard, or staging app that should only be reachable by the user.
 
 Deploys a containerized application on instanode.dev (POST /deploy/new).
 
