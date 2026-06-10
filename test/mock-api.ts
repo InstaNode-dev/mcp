@@ -16,7 +16,19 @@
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
+
+/**
+ * Mirror the api's generateAppID() (api/internal/handlers/deploy.go):
+ * hex.EncodeToString of 4 random bytes => exactly 8 lowercase hex chars.
+ * BUG-MCP-043 revert: a prior change made the mock emit UUID-shaped app_ids to
+ * satisfy a (wrong) UUID schema. Prod app_ids are 8-hex, so the mock must emit
+ * 8-hex too — otherwise create_deploy -> {get,redeploy,delete,...} can never
+ * round-trip in tests the way it can't in prod.
+ */
+function generateAppId(): string {
+  return randomBytes(4).toString("hex");
+}
 
 /** A resource the mock has "provisioned". */
 export interface MockResource {
@@ -419,7 +431,7 @@ export function startMockApi(): Promise<MockApiHandle> {
           return token;
         },
         seedDeployment: (opts) => {
-          const appId = opts?.app_id ?? randomUUID();
+          const appId = opts?.app_id ?? generateAppId();
           const env = { ...(opts?.env ?? {}) };
           if (opts?.wakeEnabled) env["_wake_enabled"] = "1";
           const deployment: MockDeployment = {
@@ -909,13 +921,13 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
       // Fall through to create-new when no existing deployment matches.
     }
 
-    // BUG-MCP-025: app_id is now validated as a UUID on the get/redeploy/
-    // delete paths, matching the real API contract. The previous
-    // `app-{shortid}` mock id silently passed because the schema was a
-    // bare string; now the mock returns a UUID-shaped app_id like prod so
-    // the test fixtures don't trip the schema.
+    // BUG-MCP-043: app_id/token is the 8-char hex public identifier (prod's
+    // generateAppID()), while the DB row id is a real UUID (openapi DeployItem
+    // .id is format:uuid). The earlier "UUID-shaped app_id" mock was a lie that
+    // masked the broken deploy-id schema — reverted here so create_deploy ->
+    // {get,redeploy,delete,events,env,wake} round-trips with a real 8-hex id.
     const id = randomUUID();
-    const appId = id;
+    const appId = generateAppId();
     const deployment: MockDeployment = {
       id,
       app_id: appId,
