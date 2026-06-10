@@ -141,6 +141,60 @@ describe("InstantClient — unit-level branch coverage", () => {
     );
   });
 
+  it("apiErrorFromEnvelope → lifts request_id + retry_after_seconds off a non-2xx envelope", async () => {
+    stubFetch(
+      () =>
+        new Response(
+          JSON.stringify({
+            ok: false,
+            error: "rate_limited",
+            message: "slow down",
+            request_id: "req_envelope_42",
+            retry_after_seconds: 30,
+          }),
+          { status: 429, headers: { "content-type": "application/json" } }
+        )
+    );
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    await assert.rejects(
+      () => c.createPostgres("db"),
+      (err: unknown) => {
+        assert.ok(err instanceof ApiError);
+        assert.equal((err as ApiError).status, 429);
+        assert.equal((err as ApiError).requestId, "req_envelope_42");
+        assert.equal((err as ApiError).retryAfterSeconds, 30);
+        return true;
+      }
+    );
+  });
+
+  it("apiErrorFromEnvelope → drops a malformed retry_after_seconds + absent request_id (defensive branch)", async () => {
+    stubFetch(
+      () =>
+        new Response(
+          JSON.stringify({
+            ok: false,
+            error: "bad_request",
+            message: "nope",
+            // request_id absent, retry_after_seconds the wrong type / negative —
+            // both must coerce to undefined rather than propagate garbage.
+            retry_after_seconds: -5,
+          }),
+          { status: 400, headers: { "content-type": "application/json" } }
+        )
+    );
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    await assert.rejects(
+      () => c.createPostgres("db"),
+      (err: unknown) => {
+        assert.ok(err instanceof ApiError);
+        assert.equal((err as ApiError).requestId, undefined);
+        assert.equal((err as ApiError).retryAfterSeconds, undefined);
+        return true;
+      }
+    );
+  });
+
   it("redeploy → empty-2xx body resolves to safe sentinel with caller-supplied id", async () => {
     stubFetch(() => new Response("", { status: 202 }));
     process.env["INSTANODE_TOKEN"] = "tok_xyz";

@@ -266,6 +266,14 @@ function validateName(name: unknown): { error: string; message: string } | null 
   return null;
 }
 
+/**
+ * A fixed request_id the mock stamps on EVERY error envelope, mirroring the
+ * real api which attaches a request_id to every ErrorResponse for support /
+ * log correlation. Fixed (not random) so tests can assert the exact value
+ * round-trips through the MCP-rendered error text.
+ */
+export const MOCK_REQUEST_ID = "req_mock_0123456789abcdef";
+
 /** Standard error envelope, matching the real API's shape. */
 function errorEnvelope(opts: {
   error?: string;
@@ -273,12 +281,24 @@ function errorEnvelope(opts: {
   upgrade_url?: string;
   agent_action?: string;
   claim_url?: string;
+  /** Seconds the api asks the caller to wait before retrying (429 / backpressure). */
+  retry_after_seconds?: number;
 }): Record<string, unknown> {
-  const e: Record<string, unknown> = { ok: false, message: opts.message };
+  // request_id is present on EVERY real api error envelope — stamp it here so
+  // the MCP's error-correlation surface (formatError "Request ID: ...") is
+  // exercised end-to-end through every error path.
+  const e: Record<string, unknown> = {
+    ok: false,
+    message: opts.message,
+    request_id: MOCK_REQUEST_ID,
+  };
   if (opts.error) e["error"] = opts.error;
   if (opts.upgrade_url) e["upgrade_url"] = opts.upgrade_url;
   if (opts.agent_action) e["agent_action"] = opts.agent_action;
   if (opts.claim_url) e["claim_url"] = opts.claim_url;
+  if (typeof opts.retry_after_seconds === "number") {
+    e["retry_after_seconds"] = opts.retry_after_seconds;
+  }
   return e;
 }
 

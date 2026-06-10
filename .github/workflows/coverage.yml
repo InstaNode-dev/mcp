@@ -62,7 +62,9 @@ jobs:
             dist-test/test/tool-coverage.test.js \
             dist-test/test/tool-contract.test.js \
             dist-test/test/env-regex-unit.test.js \
-            dist-test/test/input-hardening-unit.test.js
+            dist-test/test/input-hardening-unit.test.js \
+            dist-test/test/deploy-id-schema-unit.test.js \
+            dist-test/test/error-contract-unit.test.js
       - uses: actions/setup-python@v6
         if: github.event_name == 'pull_request'
         with:

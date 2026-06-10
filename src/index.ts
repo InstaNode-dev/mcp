@@ -190,11 +190,22 @@ export function formatError(err: unknown): string {
     if (err.agentAction && err.agentAction.length > 0) {
       lines.push("", `Action: ${err.agentAction}`);
     }
+    // Surface retry_after_seconds when the api asks the caller to back off
+    // (429 + transient-backpressure envelopes) so the agent waits the right
+    // amount of time instead of hammering or guessing.
+    if (typeof err.retryAfterSeconds === "number" && err.retryAfterSeconds >= 0) {
+      lines.push(`Retry after: ${err.retryAfterSeconds}s`);
+    }
     if (err.upgradeURL && err.upgradeURL.length > 0) {
       lines.push(`Upgrade: ${err.upgradeURL}`);
     }
     if (err.claimURL && err.claimURL.length > 0) {
       lines.push(`Claim:   ${err.claimURL}`);
+    }
+    // Always last: the support / log-correlation id. An agent or user can quote
+    // it when reporting the failure so the operator can grep it in the api logs.
+    if (err.requestId && err.requestId.length > 0) {
+      lines.push(`Request ID: ${err.requestId}`);
     }
     return lines.join("\n");
   }
@@ -202,8 +213,40 @@ export function formatError(err: unknown): string {
   return `instanode.dev error: ${msg}`;
 }
 
-export function textResult(text: string) {
-  return { content: [{ type: "text" as const, text }] };
+/**
+ * Wrap text in a CallToolResult. `isError` defaults to false (a SUCCESS result).
+ * The MCP spec distinguishes a tool-execution FAILURE from a success by the
+ * `isError: true` flag on the result — a host/agent reads it to know the
+ * operation did not happen. Success results MUST NOT set it. Use `errorResult`
+ * (below) for the failure path so the flag is applied uniformly.
+ */
+export function textResult(text: string, isError = false) {
+  const result: { content: { type: "text"; text: string }[]; isError?: boolean } = {
+    content: [{ type: "text" as const, text }],
+  };
+  if (isError) result.isError = true;
+  return result;
+}
+
+/**
+ * The shared failure-rendering path for every tool. Maps a thrown error
+ * (ApiError / AuthRequiredError / plain Error) to a CallToolResult whose
+ * `isError` is true, so MCP hosts and agents can distinguish a tool FAILURE
+ * (the operation did not happen) from a SUCCESS.
+ *
+ * Per the MCP spec a tool-execution failure is reported IN the result via
+ * `isError: true` — not as a protocol-level error. Every api-side failure the
+ * MCP maps (402 upgrade-required, 403 permission, 404 not-found, 409 conflict,
+ * 429 rate-limit, 5xx, 501) is a tool failure: the requested operation did not
+ * complete. A 402/403 "upgrade/permission required" is still a failure (the
+ * provision/deploy did not happen) — the agent_action text is preserved by
+ * formatError so the agent still gets the path forward.
+ *
+ * Centralising here means all ~40 tool catch blocks get the flag uniformly via
+ * `return errorResult(err)` instead of `return textResult(formatError(err))`.
+ */
+export function errorResult(err: unknown) {
+  return textResult(formatError(err), true);
 }
 
 export function formatLimits(limits: ProvisionLimits | undefined): string[] {
@@ -230,6 +273,27 @@ export function appendUpgradeBlock(
   if (result.upgrade) {
     lines.push(``, `Claim URL (direct the user here to keep this resource past 24h):`);
     lines.push(`  ${result.upgrade}`);
+  }
+}
+
+/**
+ * Surface `ignored_fields` — unknown request-body keys the api silently dropped
+ * (api D7 / #283). When an agent sends a hallucinated param (e.g. `region`,
+ * `size`), the api ignores it and echoes the dropped key(s) so the caller
+ * learns the param had no effect and stops resending it. No-op on a clean
+ * request (absent or empty array). Shared across every provision tool.
+ */
+export function appendIgnoredFields(
+  lines: string[],
+  result: { ignored_fields?: string[] }
+): void {
+  const ignored = result.ignored_fields;
+  if (Array.isArray(ignored) && ignored.length > 0) {
+    lines.push(
+      ``,
+      `Note: the api ignored ${ignored.length} unknown field(s) you sent: ${ignored.join(", ")}. ` +
+        `They had no effect — remove them or check the tool schema for the correct param names.`
+    );
   }
 }
 
@@ -431,6 +495,7 @@ Store the connection_url in an env var (DATABASE_URL); do not hardcode it.`,
         ...formatLimits(result.limits),
       ];
       appendUpgradeBlock(lines, result);
+      appendIgnoredFields(lines, result);
       lines.push(
         ``,
         `Use directly as DATABASE_URL (add .env to .gitignore):`,
@@ -440,7 +505,7 @@ Store the connection_url in an env var (DATABASE_URL); do not hardcode it.`,
       );
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -500,6 +565,7 @@ The 'name' field is required.`,
         ...formatLimits(result.limits),
       ];
       appendUpgradeBlock(lines, result);
+      appendIgnoredFields(lines, result);
       lines.push(
         ``,
         `Use directly as DATABASE_URL (add .env to .gitignore):`,
@@ -510,7 +576,7 @@ The 'name' field is required.`,
       );
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -548,6 +614,7 @@ The 'name' field is required.`,
         ...formatLimits(result.limits),
       ];
       appendUpgradeBlock(lines, result);
+      appendIgnoredFields(lines, result);
       lines.push(
         ``,
         `Use directly as REDIS_URL:`,
@@ -555,7 +622,7 @@ The 'name' field is required.`,
       );
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -593,6 +660,7 @@ The 'name' field is required.`,
         ...formatLimits(result.limits),
       ];
       appendUpgradeBlock(lines, result);
+      appendIgnoredFields(lines, result);
       lines.push(
         ``,
         `Use directly as MONGODB_URI:`,
@@ -600,7 +668,7 @@ The 'name' field is required.`,
       );
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -637,6 +705,7 @@ The 'name' field is required.`,
         ...formatLimits(result.limits),
       ];
       appendUpgradeBlock(lines, result);
+      appendIgnoredFields(lines, result);
       lines.push(
         ``,
         `Use directly as NATS_URL:`,
@@ -644,7 +713,7 @@ The 'name' field is required.`,
       );
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -693,6 +762,7 @@ The 'name' field is required.`,
         ...formatLimits(result.limits),
       ];
       appendUpgradeBlock(lines, result);
+      appendIgnoredFields(lines, result);
       lines.push(
         ``,
         `S3-compatible — use with the AWS SDK in any language:`,
@@ -702,7 +772,7 @@ The 'name' field is required.`,
       );
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -740,6 +810,7 @@ delete_resource to tear down on demand.`,
         ...formatLimits(result.limits),
       ];
       appendUpgradeBlock(lines, result);
+      appendIgnoredFields(lines, result);
       lines.push(
         ``,
         `Point any provider at the receive_url; GET it to pull stored requests:`,
@@ -748,7 +819,7 @@ delete_resource to tear down on demand.`,
       );
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -897,7 +968,7 @@ a URL the user can click in their browser.`,
       }
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -937,7 +1008,7 @@ token, tier, status, name, and expiry.`,
         [`${items.length} resource(s) on this account:`, "", ...rows].join("\n")
       );
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -981,7 +1052,7 @@ Requires INSTANODE_TOKEN.`,
       if (result.message) lines.push(`Message: ${result.message}`);
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -1043,7 +1114,7 @@ agent can route the user to the dashboard instead of guessing.`,
       ];
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -1256,7 +1327,7 @@ Requires INSTANODE_TOKEN (anonymous tier cannot deploy).`,
       );
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -1276,9 +1347,10 @@ and resource deps (\`needs: [postgres, redis]\` to auto-provision and bind, or
 \`http://<name>:<port>\` URLs at deploy time.
 
 ANONYMOUS-FRIENDLY: no INSTANODE_TOKEN required. Anonymous stacks land at the
-anonymous tier with a 24h TTL, rate-limited by /24-subnet fingerprint. The
+anonymous tier with a 6h TTL (a stack is live compute, so its window is tighter
+than the 24h anonymous RESOURCE TTL), rate-limited by /24-subnet fingerprint. The
 response carries the same 'note' + 'upgrade' (claim) URL as create_postgres so
-the agent can prompt the user to keep the stack past 24h. With INSTANODE_TOKEN
+the agent can prompt the user to keep the stack past 6h. With INSTANODE_TOKEN
 the stack inherits the user's plan tier and is permanent.
 
 Multipart shape (the client builds this for you):
@@ -1311,7 +1383,7 @@ Each tarball: gzip(tar(<service-build-dir>)) → base64, cap 50 MiB per service
 (client-enforced). Total request body cap is 200 MB across all services (api).
 
 Returns: stack_id, status, tier, env, per-service { name, port, expose, url,
-status } (only exposed services get a public URL), expires_in (24h on anon),
+status } (only exposed services get a public URL), expires_in (6h on anon),
 plus the anonymous-tier upgrade fields.`,
   {
     name: nameSchema,
@@ -1407,7 +1479,7 @@ plus the anonymous-tier upgrade fields.`,
       );
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -1458,7 +1530,7 @@ per-service { name, port, expose, url, status }, expires_in.`,
       appendUpgradeBlock(lines, result);
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -1506,7 +1578,7 @@ Requires INSTANODE_TOKEN.`,
         [`${result.total} deployment(s) on this team:`, "", ...rows].join("\n")
       );
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -1566,7 +1638,7 @@ Requires INSTANODE_TOKEN.`,
       }
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -1654,7 +1726,7 @@ clean "not found" (the api never confirms other teams' deployments).`,
       );
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -1717,7 +1789,7 @@ Requires INSTANODE_TOKEN.`,
       lines.push(``, `Poll get_deployment({ id: "${appId}" }) until status="running".`);
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -1747,7 +1819,7 @@ Requires INSTANODE_TOKEN.`,
       if (result.message) lines.push(`Message: ${result.message}`);
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -1811,10 +1883,29 @@ its first call. The response is the same for every caller.`,
           }
         }
         lines.push(`    deployments: ${fmt(t.deployments_apps)}`);
+        // resource_count_limit — per-service cap on the NUMBER of active
+        // resources (distinct from storage/connection caps). The tool
+        // description promises this; render the per-service counts compactly
+        // (e.g. "postgres 5, redis 3"). -1 = unlimited.
+        const counts = t.resource_count_limit ?? {};
+        const countSvcs = Object.keys(counts);
+        if (countSvcs.length > 0) {
+          const pairs = countSvcs.map((svc) => `${svc} ${fmt(counts[svc])}`);
+          lines.push(`    resource count: ${pairs.join(", ")}`);
+        }
+        // backup + RPO/RTO durability promise — the description advertises
+        // "backup + RPO/RTO promises". Show backup retention + manual-backup
+        // quota when restore is enabled, then RPO/RTO when promised (0 = not
+        // promised, e.g. the anonymous/free tiers).
         if (t.backup_restore_enabled) {
           lines.push(
             `    backups: ${t.backup_retention_days}d retention, ` +
               `${t.manual_backups_per_day}/day manual`
+          );
+        }
+        if (t.rpo_minutes > 0 || t.rto_minutes > 0) {
+          lines.push(
+            `    durability: RPO ${t.rpo_minutes}m, RTO ${t.rto_minutes}m`
           );
         }
         if (t.annual_discount_percent > 0) {
@@ -1827,7 +1918,7 @@ its first call. The response is the same for every caller.`,
       if (result.contact) lines.push(`Enterprise: ${result.contact}`);
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -1880,7 +1971,7 @@ Requires INSTANODE_TOKEN.`,
       ];
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -1927,7 +2018,7 @@ Requires INSTANODE_TOKEN.`,
       ];
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -1980,7 +2071,7 @@ team returns a clean 404 (the api never confirms other teams' deployments).`,
       );
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -2034,7 +2125,7 @@ slug not on your team returns a clean 404. Requires INSTANODE_TOKEN.`,
       );
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -2103,7 +2194,7 @@ no '..' path traversal — the api rejects those).`,
       ];
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -2142,7 +2233,7 @@ Requires INSTANODE_TOKEN. A token not on your team returns a clean 404.`,
       lines.push(``, `Resume with: resume_resource({ id: "${id}" }).`);
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -2177,7 +2268,7 @@ team returns a clean 404.`,
       if (result.message) lines.push(`Message: ${result.message}`);
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -2218,7 +2309,7 @@ Requires INSTANODE_TOKEN. A token not on your team returns a clean 404.`,
       ];
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
@@ -2259,7 +2350,7 @@ Requires INSTANODE_TOKEN. A deployment id not on your team returns a clean 404.`
       );
       return textResult(lines.join("\n"));
     } catch (err) {
-      return textResult(formatError(err));
+      return errorResult(err);
     }
   }
 );
