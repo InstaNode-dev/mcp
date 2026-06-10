@@ -30,6 +30,13 @@ const SERVER_ENTRY = resolve(
   "index.js"
 );
 
+// Cold-start budget for spawning the real built binary. Under the coverage
+// run's V8 instrumentation + full-suite parallel load the child's cold start
+// can exceed a tight 5s budget → status:null (killed) → flaky failure on the
+// `npm test` (coverage) variant. 15s absorbs that load; the binary still exits
+// near-instantly for --version/--help in the common case.
+const BINARY_SPAWN_TIMEOUT_MS = 15000;
+
 let server: any;
 let handleCLIFlags: (argv: readonly string[]) => boolean;
 let isIPOrCIDR: (s: string) => boolean;
@@ -65,7 +72,7 @@ describe("BUG-MCP-017: real-binary short-circuit", () => {
     const r = spawnSync(process.execPath, [SERVER_ENTRY, "--version"], {
       env: { ...process.env, INSTANODE_MCP_NO_LISTEN: "" },
       encoding: "utf8",
-      timeout: 5000,
+      timeout: BINARY_SPAWN_TIMEOUT_MS,
     });
     assert.equal(r.status, 0, `non-zero exit: stderr=${r.stderr}`);
     assert.match(r.stdout, /\d+\.\d+\.\d+|dev/);
@@ -74,7 +81,7 @@ describe("BUG-MCP-017: real-binary short-circuit", () => {
     const r = spawnSync(process.execPath, [SERVER_ENTRY, "--help"], {
       env: { ...process.env, INSTANODE_MCP_NO_LISTEN: "" },
       encoding: "utf8",
-      timeout: 5000,
+      timeout: BINARY_SPAWN_TIMEOUT_MS,
     });
     assert.equal(r.status, 0, `non-zero exit: stderr=${r.stderr}`);
     assert.match(r.stdout, /instanode-mcp/);
