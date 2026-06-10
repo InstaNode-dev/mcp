@@ -732,11 +732,13 @@ describe("instanode-mcp integration suite", () => {
     it("get_deployment returns a not-found error for an unknown app id", async () => {
       const { client, close } = await connectClient(mock.url, "valid");
       try {
-        // BUG-MCP-025: id must be a real UUID — supply one the mock doesn't
-        // know about so the API still returns 404.
+        // BUG-MCP-043: id is an 8-char hex app_id (NOT a UUID). Supply one the
+        // mock never minted so the call passes the deployIdSchema at the SDK
+        // dispatch boundary and the API still returns 404. (A UUID here would be
+        // rejected client-side, never reaching the 404 path this test asserts.)
         const res = await client.callTool({
           name: "get_deployment",
-          arguments: { id: "00000000-0000-4000-8000-000000000404" },
+          arguments: { id: "deadbeef" },
         });
         assert.ok(/404|not found/i.test(resultText(res)), "get_deployment did not surface a 404");
       } finally {
@@ -747,12 +749,13 @@ describe("instanode-mcp integration suite", () => {
     it("redeploy returns a not-found error for an unknown app id", async () => {
       const { client, close } = await connectClient(mock.url, "valid");
       try {
-        // BUG-MCP-025: see above — UUID-shaped + unknown.
+        // BUG-MCP-043: see above — 8-hex app_id + unknown, so it clears the
+        // deployIdSchema dispatch gate and the API returns 404.
         // tarball_base64 is now required (real api: deploy.go:1245).
         const res = await client.callTool({
           name: "redeploy",
           arguments: {
-            id: "00000000-0000-4000-8000-000000000404",
+            id: "deadbeef",
             tarball_base64: fakeTarballBase64(),
           },
         });

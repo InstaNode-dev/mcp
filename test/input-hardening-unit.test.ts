@@ -271,19 +271,15 @@ describe("BUG-MCP-021: create_deploy private+allowed_ips coupling (handler)", ()
   });
 });
 
-// ── BUG-MCP-024 / 025: UUID schemas ─────────────────────────────────────────
+// ── BUG-MCP-024: UUID schemas on RESOURCE-token fields ──────────────────────
+// Resource tokens ARE real UUIDs, so uuidSchema is correct for them.
 
-describe("BUG-MCP-024/025: UUID validation on token/id fields", () => {
+describe("BUG-MCP-024: UUID validation on resource-token fields", () => {
   const uuidSamples = {
     good: "8b1f3c9e-1234-4abc-9def-0123456789ab",
     bad: "not-a-uuid",
   };
-  for (const [tool, field] of [
-    ["delete_resource", "token"],
-    ["get_deployment", "id"],
-    ["redeploy", "id"],
-    ["delete_deployment", "id"],
-  ] as const) {
+  for (const [tool, field] of [["delete_resource", "token"]] as const) {
     it(`${tool}.${field} accepts a real UUID`, () => {
       const s = schemaFor(tool, field);
       assert.equal(s.safeParse(uuidSamples.good).success, true);
@@ -291,6 +287,39 @@ describe("BUG-MCP-024/025: UUID validation on token/id fields", () => {
     it(`${tool}.${field} rejects a non-UUID`, () => {
       const s = schemaFor(tool, field);
       assert.equal(s.safeParse(uuidSamples.bad).success, false);
+    });
+  }
+});
+
+// ── BUG-MCP-043: deploy-id fields are 8-hex app_ids, NOT UUIDs ───────────────
+// The original BUG-MCP-025 lumped these in with delete_resource and asserted
+// they accept a UUID — that assertion was wrong (it codified the very bug that
+// broke the manage-the-deploy loop). A deployment's id is the api's 8-char
+// lowercase-hex app_id. Asserted here against the registered schema (the SDK
+// dispatch path), so the inversion can never silently come back.
+
+describe("BUG-MCP-043: 8-hex deploy-id validation on deployment fields", () => {
+  const samples = {
+    goodAppId: "a3f91c0e",
+    aUuid: "8b1f3c9e-1234-4abc-9def-0123456789ab",
+    bad: "not-an-id",
+  };
+  for (const [tool, field] of [
+    ["get_deployment", "id"],
+    ["redeploy", "id"],
+    ["delete_deployment", "id"],
+  ] as const) {
+    it(`${tool}.${field} accepts a real 8-hex app_id`, () => {
+      const s = schemaFor(tool, field);
+      assert.equal(s.safeParse(samples.goodAppId).success, true);
+    });
+    it(`${tool}.${field} rejects a UUID (deploy ids are never UUIDs)`, () => {
+      const s = schemaFor(tool, field);
+      assert.equal(s.safeParse(samples.aUuid).success, false);
+    });
+    it(`${tool}.${field} rejects a non-id`, () => {
+      const s = schemaFor(tool, field);
+      assert.equal(s.safeParse(samples.bad).success, false);
     });
   }
 });

@@ -280,6 +280,18 @@ const envSchema = z
 const UUID_REGEX =
   /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
+// BUG-MCP-043: a deployment's public identifier (`app_id` / `token`, returned
+// as `deploy_id` by create_deploy) is NOT a UUID — the api's generateAppID()
+// (api/internal/handlers/deploy.go) is hex.EncodeToString of 4 random bytes =>
+// exactly 8 lowercase hex chars. The openapi route params for /deploy/{id},
+// /deploy/{id}/events, /deploy/{id}/wake, and /api/v1/deployments/{id} are bare
+// `{type: string}`. A canonical-UUID regex therefore REJECTS every real
+// deployment id client-side (zod -32602) before the request reaches the api,
+// breaking the entire manage-the-deploy loop (status/events/redeploy/delete/
+// env/wake) through MCP. This regex matches the real format so the validation
+// error message stays precise while accepting genuine ids.
+const APP_ID_REGEX = /^[0-9a-f]{8}$/;
+
 // BUG-MCP-022: client-side IP-or-CIDR validation for the `allowed_ips` field
 // on create_deploy. Accepts:
 //   - IPv4 address (e.g. "203.0.113.42")
@@ -322,6 +334,18 @@ const uuidSchema = z
   .regex(
     UUID_REGEX,
     "must be a UUID in canonical 8-4-4-4-12 form (e.g. 8b1f3c9e-...-...)"
+  );
+
+// deployIdSchema validates the 8-char hex `app_id`/`token` used to address a
+// deployment (see APP_ID_REGEX above). DISTINCT from uuidSchema: resource
+// tokens are real UUIDs, deployment ids are 8-hex. Used only by the six
+// deployment-by-id tools (get_deployment, get_deployment_events, redeploy,
+// delete_deployment, update_deploy_env, wake_deployment).
+export const deployIdSchema = z
+  .string()
+  .regex(
+    APP_ID_REGEX,
+    "must be an 8-character lowercase-hex deployment id (e.g. a3f91c0e), as returned by create_deploy"
   );
 
 // Vault env / key shapes — mirror the api's validateEnv / validateKey
@@ -1499,8 +1523,8 @@ single record.
 
 Requires INSTANODE_TOKEN.`,
   {
-    // BUG-MCP-025: validate UUID client-side.
-    id: uuidSchema.describe("Deployment app id (returned as 'deploy_id' by create_deploy)."),
+    // BUG-MCP-043: app_id is 8-char hex, not a UUID. Validate client-side.
+    id: deployIdSchema.describe("Deployment app id (returned as 'deploy_id' by create_deploy)."),
   },
   async ({ id }) => {
     try {
@@ -1575,8 +1599,8 @@ If the deploy succeeded there may be no events (empty list) — that's normal.
 Requires INSTANODE_TOKEN. A deployment id that isn't on your team returns a
 clean "not found" (the api never confirms other teams' deployments).`,
   {
-    // BUG-MCP-025: validate UUID client-side, mirroring get_deployment.
-    id: uuidSchema.describe(
+    // BUG-MCP-043: app_id is 8-char hex, not a UUID. Mirrors get_deployment.
+    id: deployIdSchema.describe(
       "Deployment app id (returned as 'deploy_id' by create_deploy / 'app_id' by get_deployment)."
     ),
     // Optional cap on rows returned. api default is 50, clamped server-side.
@@ -1658,8 +1682,8 @@ to "running" (~30s typical).
 
 Requires INSTANODE_TOKEN.`,
   {
-    // BUG-MCP-025: validate UUID client-side.
-    id: uuidSchema.describe("Deployment app id (returned as 'deploy_id' by create_deploy)."),
+    // BUG-MCP-043: app_id is 8-char hex, not a UUID. Validate client-side.
+    id: deployIdSchema.describe("Deployment app id (returned as 'deploy_id' by create_deploy)."),
     // T-redeploy-fix: tarball is required. The api handler at
     // deploy.go:1245 returns 400 missing_tarball without it; the previous
     // tool schema omitted this field and the description lied about
@@ -1708,8 +1732,8 @@ deleted. Irreversible.
 
 Requires INSTANODE_TOKEN.`,
   {
-    // BUG-MCP-025: validate UUID client-side.
-    id: uuidSchema.describe("Deployment app id (returned as 'deploy_id' by create_deploy)."),
+    // BUG-MCP-043: app_id is 8-char hex, not a UUID. Validate client-side.
+    id: deployIdSchema.describe("Deployment app id (returned as 'deploy_id' by create_deploy)."),
   },
   async ({ id }) => {
     try {
@@ -1925,7 +1949,8 @@ Values can be plaintext or vault://env/KEY references (write the secret first
 with set_vault_key). Requires INSTANODE_TOKEN. A deployment id not on your
 team returns a clean 404 (the api never confirms other teams' deployments).`,
   {
-    id: uuidSchema.describe(
+    // BUG-MCP-043: app_id is 8-char hex, not a UUID. Validate client-side.
+    id: deployIdSchema.describe(
       "Deployment app id (returned as 'deploy_id' by create_deploy / 'app_id' by get_deployment)."
     ),
     env: z
@@ -2218,7 +2243,8 @@ always-on, so there's nothing to wake.
 
 Requires INSTANODE_TOKEN. A deployment id not on your team returns a clean 404.`,
   {
-    id: uuidSchema.describe(
+    // BUG-MCP-043: app_id is 8-char hex, not a UUID. Validate client-side.
+    id: deployIdSchema.describe(
       "Deployment app id (returned as 'deploy_id' by create_deploy / 'app_id' by get_deployment)."
     ),
   },
