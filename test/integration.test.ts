@@ -65,6 +65,7 @@ const EXPECTED_TOOLS = [
   "get_stack",
   "list_deployments",
   "get_deployment",
+  "get_deployment_events",
   "redeploy",
   "delete_deployment",
   "claim_resource",
@@ -72,6 +73,17 @@ const EXPECTED_TOOLS = [
   "list_resources",
   "delete_resource",
   "get_api_token",
+  "get_capabilities",
+  // ── operate (full-lifecycle) tools ──
+  "set_vault_key",
+  "rotate_vault_key",
+  "update_deploy_env",
+  "update_stack_env",
+  "presign_storage",
+  "pause_resource",
+  "resume_resource",
+  "rotate_credentials",
+  "wake_deployment",
 ] as const;
 
 /**
@@ -203,7 +215,7 @@ describe("instanode-mcp integration suite", () => {
   // ── Tool registry + schemas ─────────────────────────────────────────────────
 
   describe("tool registry", () => {
-    it("registers exactly the 19 contract tools, no dead ones", async () => {
+    it("registers exactly the 30 contract tools, no dead ones", async () => {
       const { client, close } = await connectClient(mock.url, "none");
       try {
         const { tools } = await client.listTools();

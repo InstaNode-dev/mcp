@@ -124,6 +124,7 @@ to reach for this MCP, see <https://instanode.dev/agent.html>.
 | `get_stack`       | `GET /stacks/{stack_id}` — Poll a stack's per-service status + URLs. Anonymous-friendly. `stack_id` required.                                                     |
 | `list_deployments`| `GET /api/v1/deployments` — List all deployments on the caller's team. Requires `INSTANODE_TOKEN`.                                                                |
 | `get_deployment`  | `GET /api/v1/deployments/:id` — Fetch one deployment (poll until `status="running"`). Requires `INSTANODE_TOKEN`.                                                 |
+| `get_deployment_events` | `GET /api/v1/deployments/:id/events` — Read the failure-timeline autopsy for a deployment (`kind`/`reason`/`exit_code`/`event`/`last_lines`/`hint`/`created_at`, newest first) so an agent can self-correct a broken Dockerfile. Optional `limit`. Requires `INSTANODE_TOKEN`. |
 | `redeploy`        | `POST /deploy/:id/redeploy` — Push updated code to an existing deployment BY ID. Same URL, new build. Requires `tarball_base64` (same shape as `create_deploy`) — the api never reuses the original tarball. For the more common "update by name" path prefer `create_deploy({ name, redeploy: true, tarball_base64 })`. Requires `INSTANODE_TOKEN`. |
 | `delete_deployment` | `DELETE /deploy/:id` — Tear down a running deployment. Irreversible. Requires `INSTANODE_TOKEN`.                                                                |
 | `claim_resource`  | Helper — turn an `upgrade_jwt` from any `create_*` response into the dashboard claim URL the user should click. No API call. No auth required.                    |
@@ -131,6 +132,16 @@ to reach for this MCP, see <https://instanode.dev/agent.html>.
 | `list_resources`  | `GET /api/v1/resources` — List resources on the caller's account. Requires `INSTANODE_TOKEN`.                                                                     |
 | `delete_resource` | `DELETE /api/v1/resources/{token}` — Hard-delete a resource you own. Paid tier only. Requires `INSTANODE_TOKEN`.                                                  |
 | `get_api_token`   | `POST /api/v1/auth/api-keys` — Mint a fresh bearer Personal Access Token (PAT). Requires an existing user-session `INSTANODE_TOKEN` (PATs cannot mint other PATs — the API returns 403 in that case). |
+| `get_capabilities`| `GET /api/v1/capabilities` — Read the live per-tier capability matrix (storage / connection / resource-count / deployment caps, pricing, backup + RPO/RTO promises) in upgrade order so an agent can plan a provision before a call `402`s. **Auth optional** (public discovery surface). |
+| `set_vault_key`   | `PUT /api/v1/vault/{env}/{key}` — Write a secret to the team vault (always a new version). Reference it from a deploy as `vault://{env}/{key}` in `env_vars`; the API decrypts it at deploy time. Vault is paid (Hobby+ = 20 entries, Pro/Team = unlimited; Hobby/Pro restrict env to `production`). Requires `INSTANODE_TOKEN`. |
+| `rotate_vault_key`| `POST /api/v1/vault/{env}/{key}/rotate` — Rotate a vault secret's value (new version, recorded under a distinct audit action). Redeploy referencing apps to apply. Requires `INSTANODE_TOKEN`. |
+| `update_deploy_env` | `PATCH /deploy/{id}/env` — Merge env vars into an existing deployment (incoming wins; values may be `vault://env/KEY` refs). Returns the merged map with secrets redacted. Redeploy to apply. Requires `INSTANODE_TOKEN`. |
+| `update_stack_env`| `PATCH /stacks/{slug}/env` — Merge env vars into an existing stack (row-locked; an empty-string value deletes a key). Redeploy the stack to apply. Requires `INSTANODE_TOKEN`. |
+| `presign_storage` | `POST /storage/{token}/presign` — Mint a short-lived (≤1h) presigned S3 URL (`GET`/`PUT`/`HEAD`) scoped to a storage prefix. Auth is the storage token in the path — works for anonymous-tier storage. `DELETE` is not offered (a leaked URL must not wipe a prefix). |
+| `pause_resource`  | `POST /api/v1/resources/{id}/pause` — Suspend a resource without deleting it (storage + connection URL preserved; new connections refused). **Pro tier or higher.** Requires `INSTANODE_TOKEN`. |
+| `resume_resource` | `POST /api/v1/resources/{id}/resume` — Un-pause a resource (same connection URL keeps working). **Pro tier or higher.** Requires `INSTANODE_TOKEN`. |
+| `rotate_credentials` | `POST /api/v1/resources/{id}/rotate-credentials` — Rotate a resource's password; returns the NEW `connection_url` in plaintext (host + DB unchanged). Locks out a leaked old URL. Requires `INSTANODE_TOKEN`. |
+| `wake_deployment` | `POST /deploy/{id}/wake` — Explicitly wake a scaled-to-zero deployment (scales to 1 replica; cold-start before serving). Flag-gated on the platform: returns 501 `scale_to_zero_disabled` when the feature is off. Requires `INSTANODE_TOKEN`. |
 
 ### Container deployment (`create_deploy`)
 

@@ -27,11 +27,36 @@
  *
  *   list_deployments   — list all deployments for the caller's team
  *   get_deployment     — fetch a deployment by app id (for polling build status)
+ *   get_deployment_events — read the failure-timeline autopsy (kind/reason/exit_code/
+ *                        hint/last_lines) for a deployment so the agent can
+ *                        self-correct a broken Dockerfile (auth required)
  *   redeploy           — push updated code to an existing deployment by id;
  *                        requires a fresh tarball (api never reuses the original).
  *                        Prefer `create_deploy({name, redeploy:true})` when you
  *                        have the name; use this when you only have the deploy id.
  *   delete_deployment  — tear down a running deployment
+ *
+ *   get_capabilities   — read the live per-tier capability matrix (storage /
+ *                        connection / deployment caps per tier) so an agent can
+ *                        plan a provision BEFORE a call 402s (auth optional)
+ *
+ *   ── operate (drive the full bundle lifecycle, not just create it) ──
+ *   set_vault_key      — write a secret to the team vault (PUT .../vault/:env/:key)
+ *                        so a deploy can reference it as vault://env/KEY
+ *   rotate_vault_key   — rotate a vault secret's value (POST .../rotate); distinct
+ *                        audit action from a plain write
+ *   update_deploy_env  — merge env vars into an existing deployment
+ *                        (PATCH /deploy/:id/env); redeploy to apply
+ *   update_stack_env   — merge env vars into an existing stack
+ *                        (PATCH /stacks/:slug/env); redeploy to apply
+ *   presign_storage    — mint a short-lived (≤1h) presigned S3 URL scoped to a
+ *                        storage prefix (POST /storage/:token/presign)
+ *   pause_resource     — suspend a resource without deleting it (Pro+)
+ *   resume_resource    — un-pause a suspended resource (Pro+)
+ *   rotate_credentials — rotate a resource's password, returns the new
+ *                        connection_url (POST .../rotate-credentials)
+ *   wake_deployment    — explicitly wake a scaled-to-zero deployment
+ *                        (POST /deploy/:id/wake; 501 when the flag is off)
  *
  * Every create_* tool surfaces the API's `note` and `upgrade` fields so the
  * agent can show the user the exact CTA + claim URL needed to keep the
@@ -59,6 +84,8 @@ import {
   InstantClient,
   type ProvisionLimits,
   type Resource,
+  type TierCapability,
+  type DeploymentEvent,
 } from "./client.js";
 import { nameSchema, NAME_PATTERN } from "./name_schema.js";
 
@@ -295,6 +322,40 @@ const uuidSchema = z
   .regex(
     UUID_REGEX,
     "must be a UUID in canonical 8-4-4-4-12 form (e.g. 8b1f3c9e-...-...)"
+  );
+
+// Vault env / key shapes — mirror the api's validateEnv / validateKey
+// (api/internal/handlers/vault.go): env is 1-64 chars [A-Za-z0-9_-], key is
+// 1-256 chars [A-Za-z0-9_.-]. These are DISTINCT from the resource `env`
+// regex above (^[a-z0-9-]{1,32}$): the vault namespace permits uppercase +
+// underscores so a `production` env can hold a `DATABASE_URL` key. Enforcing
+// here surfaces a precise zod error instead of an api 400 round-trip, and
+// keeps the regex in one constant so the api/CLI/MCP stay in lockstep.
+const VAULT_ENV_REGEX = /^[A-Za-z0-9_-]{1,64}$/;
+const VAULT_KEY_REGEX = /^[A-Za-z0-9_.-]{1,256}$/;
+const vaultEnvSchema = z
+  .string()
+  .regex(
+    VAULT_ENV_REGEX,
+    "vault env must match ^[A-Za-z0-9_-]{1,64}$ (e.g. production, staging)"
+  );
+const vaultKeySchema = z
+  .string()
+  .regex(
+    VAULT_KEY_REGEX,
+    "vault key must match ^[A-Za-z0-9_.-]{1,256}$ (e.g. DATABASE_URL, STRIPE_KEY)"
+  );
+
+// Vault value cap mirrors vaultMaxValueBytes in api/internal/handlers/vault.go
+// (1 MiB). Catch an oversized payload at the zod boundary rather than after a
+// 413 round-trip.
+const VAULT_MAX_VALUE_BYTES = 1024 * 1024;
+const vaultValueSchema = z
+  .string()
+  .min(1, "value must not be empty")
+  .max(
+    VAULT_MAX_VALUE_BYTES,
+    "value exceeds the 1 MiB vault cap — store large blobs in object storage and vault only a reference"
   );
 
 const ipOrCidrSchema = z
@@ -1486,6 +1547,94 @@ Requires INSTANODE_TOKEN.`,
   }
 );
 
+// ── Tool: get_deployment_events ───────────────────────────────────────────────
+
+server.tool(
+  "get_deployment_events",
+  `Read the failure-timeline autopsy for a deployment (GET /api/v1/deployments/:id/events).
+
+This is the rule-27 self-correction surface: when a deploy is stuck in
+"building" or flips to "failed", get_deployment only shows the LATEST error
+string — this tool returns the full chronological autopsy the platform's
+worker captured (Kaniko build failures, k8s pod events, OOM kills, image-pull
+errors). Each event carries:
+  - kind       (e.g. "failure_autopsy")
+  - reason     (e.g. "BackoffLimitExceeded", "OOMKilled", "ImagePullBackOff")
+  - exit_code  (process exit code, or null when not an exit)
+  - event      (k8s event type, when captured)
+  - last_lines (the tail of the build/pod log — usually the actual error)
+  - hint       (a remediation suggestion you can act on)
+  - created_at (RFC3339 UTC)
+
+Events are newest-first, so events[0] is the most recent failure. Use this to
+fix a broken Dockerfile or misconfigured port without guessing: read the hint
+and last_lines, patch the project, then redeploy.
+
+If the deploy succeeded there may be no events (empty list) — that's normal.
+
+Requires INSTANODE_TOKEN. A deployment id that isn't on your team returns a
+clean "not found" (the api never confirms other teams' deployments).`,
+  {
+    // BUG-MCP-025: validate UUID client-side, mirroring get_deployment.
+    id: uuidSchema.describe(
+      "Deployment app id (returned as 'deploy_id' by create_deploy / 'app_id' by get_deployment)."
+    ),
+    // Optional cap on rows returned. api default is 50, clamped server-side.
+    limit: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe(
+        "Max number of events to return (newest first). Optional — the api defaults to 50 and clamps to its own maximum. Omit to use the default."
+      ),
+  },
+  async ({ id, limit }) => {
+    try {
+      const result = await client.getDeploymentEvents(id, limit);
+      if (!result.events || result.events.length === 0) {
+        return textResult(
+          `No events recorded for deployment ${id}.\n\n` +
+            `This is normal for a deployment that built and is running cleanly — ` +
+            `the failure-timeline only records build/runtime failures. If the ` +
+            `deploy is stuck in "building", re-poll get_deployment and try ` +
+            `get_deployment_events again in a few seconds; the worker writes the ` +
+            `autopsy asynchronously once the failure is detected.`
+        );
+      }
+      const lines: string[] = [
+        `${result.count} event(s) for deployment ${id} (newest first):`,
+        "",
+      ];
+      result.events.forEach((ev: DeploymentEvent, i: number) => {
+        lines.push(`[${i + 1}] ${ev.kind}${ev.reason ? ` — ${ev.reason}` : ""}`);
+        if (ev.created_at) lines.push(`    when:       ${ev.created_at}`);
+        if (ev.event) lines.push(`    k8s event:  ${ev.event}`);
+        if (typeof ev.exit_code === "number") {
+          lines.push(`    exit code:  ${ev.exit_code}`);
+        }
+        if (ev.hint) lines.push(`    hint:       ${ev.hint}`);
+        if (ev.last_lines) {
+          // Render the log tail under its own indented heading so a multi-line
+          // blob stays visually grouped with its event.
+          lines.push(`    last lines:`);
+          for (const ll of ev.last_lines.split("\n")) {
+            lines.push(`      ${ll}`);
+          }
+        }
+        lines.push("");
+      });
+      lines.push(
+        `Act on the most recent event's hint + last_lines: patch your project, ` +
+          `then redeploy (create_deploy({ name, redeploy: true }) or redeploy({ id })).`
+      );
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
+    }
+  }
+);
+
 // ── Tool: redeploy ────────────────────────────────────────────────────────────
 
 server.tool(
@@ -1572,6 +1721,516 @@ Requires INSTANODE_TOKEN.`,
         `Status: ${result.status ?? "deleted"}`,
       ];
       if (result.message) lines.push(`Message: ${result.message}`);
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
+    }
+  }
+);
+
+// ── Tool: get_capabilities ────────────────────────────────────────────────────
+
+server.tool(
+  "get_capabilities",
+  `Read the live per-tier capability matrix (GET /api/v1/capabilities).
+
+Use this BEFORE a provision/deploy call to plan around tier limits instead of
+provisioning-to-discover them and eating a 402 mid-flow. The api iterates its
+live plans registry, so the response is always current — tiers today are
+anonymous and free (both no-cost, 24h-TTL), then the paid tiers hobby ($9/mo),
+hobby_plus ($19/mo), pro ($49/mo), growth ($99/mo) and team ($199/mo). The
+exact numbers come from the api, not this description, so they never drift.
+
+Per tier you get:
+  - storage_limit_mb     — per-service storage cap (postgres/redis/mongodb/
+                           queue/storage/webhook/vector); -1 = unlimited
+  - connections_limit    — per-service max connections; -1 = unlimited
+  - resource_count_limit — per-service max number of active resources; -1 = unlimited
+  - deployments_apps     — max concurrent deployed apps; -1 = unlimited
+  - price_usd_monthly, paid_from_day_one, annual_discount_percent
+  - backup_retention_days / backup_restore_enabled / manual_backups_per_day
+  - rpo_minutes / rto_minutes (durability promise; 0 = not promised)
+  - upgrade_url (null on the terminal Team tier) + is_terminal_tier
+
+Tiers are returned in upgrade order (cheapest first). NO INSTANODE_TOKEN
+required — this is a public discovery surface so a cold-start agent can plan
+its first call. The response is the same for every caller.`,
+  {},
+  async () => {
+    try {
+      const result = await client.getCapabilities();
+      if (!result.tiers || result.tiers.length === 0) {
+        return textResult(
+          "The capability matrix is currently empty (the api returned no tiers). " +
+            "Retry shortly; if it persists the api's plans registry may be unloaded."
+        );
+      }
+      const lines: string[] = [
+        `${result.tiers.length} tier(s) (cheapest first):`,
+        "",
+      ];
+      const fmt = (n: number): string => (n < 0 ? "unlimited" : String(n));
+      for (const t of result.tiers as TierCapability[]) {
+        const price =
+          t.price_usd_monthly > 0 ? `$${t.price_usd_monthly}/mo` : "free";
+        const terminal = t.is_terminal_tier ? " (top tier)" : "";
+        lines.push(`${t.display_name ?? t.tier} [${t.tier}] — ${price}${terminal}`);
+        // Render the per-service storage + connection caps compactly.
+        const storage = t.storage_limit_mb ?? {};
+        const conns = t.connections_limit ?? {};
+        const services = Object.keys(storage);
+        if (services.length > 0) {
+          for (const svc of services) {
+            const s = fmt(storage[svc]);
+            const c = conns[svc] !== undefined ? `, ${fmt(conns[svc])} conn` : "";
+            lines.push(`    ${svc}: ${s === "unlimited" ? "unlimited" : `${s} MB`}${c}`);
+          }
+        }
+        lines.push(`    deployments: ${fmt(t.deployments_apps)}`);
+        if (t.backup_restore_enabled) {
+          lines.push(
+            `    backups: ${t.backup_retention_days}d retention, ` +
+              `${t.manual_backups_per_day}/day manual`
+          );
+        }
+        if (t.annual_discount_percent > 0) {
+          lines.push(`    annual: save ${t.annual_discount_percent}%`);
+        }
+        if (t.upgrade_url) lines.push(`    upgrade: ${t.upgrade_url}`);
+        lines.push("");
+      }
+      if (result.docs) lines.push(`Full docs: ${result.docs}`);
+      if (result.contact) lines.push(`Enterprise: ${result.contact}`);
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
+    }
+  }
+);
+
+// ── Tool: set_vault_key ───────────────────────────────────────────────────────
+
+server.tool(
+  "set_vault_key",
+  `Write a secret to the team vault (PUT /api/v1/vault/:env/:key).
+
+This is the WRITE side of the vault:// references create_deploy advertises.
+Store a secret here, then reference it from a deploy as vault://<env>/<key> in
+env_vars (or resource_bindings) — the api decrypts it at deploy time so the
+plaintext never sits in your tool params or the deploy record. Closes the gap
+where create_deploy could point at vault://env/KEY but there was no MCP tool to
+populate it.
+
+Every write creates a NEW version (v1 on first create, v2+ on updates), so the
+returned 'version' tells you which generation this call minted. The plaintext
+value is never echoed back.
+
+Vault is a paid feature: Hobby+ (20 entries) through Pro/Team (unlimited). On
+anonymous/free you get 403 vault_not_available; at the entry cap you get 402.
+Hobby/Pro tiers restrict the env to 'production' only — pass env="production"
+there (the api returns 403 vault_env_not_allowed otherwise).
+
+Requires INSTANODE_TOKEN.`,
+  {
+    env: vaultEnvSchema.describe(
+      "Vault environment namespace (e.g. 'production', 'staging'). Hobby/Pro tiers allow 'production' only. Format: ^[A-Za-z0-9_-]{1,64}$."
+    ),
+    key: vaultKeySchema.describe(
+      "Secret key name (e.g. 'DATABASE_URL', 'STRIPE_SECRET_KEY'). Format: ^[A-Za-z0-9_.-]{1,256}$. Reference it later as vault://<env>/<key>."
+    ),
+    value: vaultValueSchema.describe(
+      "The secret value (≤1 MiB). Stored encrypted at rest; never echoed back."
+    ),
+  },
+  async ({ env, key, value }) => {
+    try {
+      const result = await client.setVaultKey(env, key, value);
+      const lines = [
+        `Secret written to the vault.`,
+        `Env:     ${result.env ?? env}`,
+        `Key:     ${result.key ?? key}`,
+        `Version: ${result.version}`,
+        ``,
+        `Reference it from a deploy as: vault://${result.env ?? env}/${result.key ?? key}`,
+        `(pass it in create_deploy env_vars; the api decrypts it at deploy time).`,
+      ];
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
+    }
+  }
+);
+
+// ── Tool: rotate_vault_key ────────────────────────────────────────────────────
+
+server.tool(
+  "rotate_vault_key",
+  `Rotate a vault secret's value (POST /api/v1/vault/:env/:key/rotate).
+
+Functionally a vault write that mints a new version, but recorded under a
+distinct audit action so the vault audit log distinguishes an intentional
+rotation (e.g. a leaked credential, scheduled key rotation) from a routine
+update. Use this when you're replacing a compromised or expiring secret;
+use set_vault_key for a first write or a normal value change.
+
+After rotating, redeploy any app that references vault://<env>/<key> so the
+new value is injected (the running container keeps the old value until its
+next deploy).
+
+Requires INSTANODE_TOKEN.`,
+  {
+    env: vaultEnvSchema.describe(
+      "Vault environment namespace of the existing secret (e.g. 'production')."
+    ),
+    key: vaultKeySchema.describe(
+      "Secret key name to rotate (e.g. 'DATABASE_URL')."
+    ),
+    value: vaultValueSchema.describe(
+      "The NEW secret value (≤1 MiB). Stored encrypted; never echoed back."
+    ),
+  },
+  async ({ env, key, value }) => {
+    try {
+      const result = await client.rotateVaultKey(env, key, value);
+      const lines = [
+        `Vault secret rotated.`,
+        `Env:     ${result.env ?? env}`,
+        `Key:     ${result.key ?? key}`,
+        `Version: ${result.version}  (a new version was minted)`,
+        ``,
+        `Redeploy any app referencing vault://${result.env ?? env}/${result.key ?? key}`,
+        `so the rotated value takes effect (running pods keep the old value until redeploy).`,
+      ];
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
+    }
+  }
+);
+
+// ── Tool: update_deploy_env ───────────────────────────────────────────────────
+
+server.tool(
+  "update_deploy_env",
+  `Merge environment variables into an existing deployment
+(PATCH /deploy/:id/env).
+
+The supplied keys are MERGED into the deployment's current env (incoming wins
+on collision) — you don't have to resend the full set. The response echoes the
+full merged map with secret values redacted. A redeploy is required to apply
+the change: the running container keeps its current env until its next build,
+so finish with create_deploy({ name, redeploy: true }) or redeploy({ id }).
+
+Values can be plaintext or vault://env/KEY references (write the secret first
+with set_vault_key). Requires INSTANODE_TOKEN. A deployment id not on your
+team returns a clean 404 (the api never confirms other teams' deployments).`,
+  {
+    id: uuidSchema.describe(
+      "Deployment app id (returned as 'deploy_id' by create_deploy / 'app_id' by get_deployment)."
+    ),
+    env: z
+      .record(z.string(), z.string())
+      .describe(
+        "Map of env var name → value to merge in. Values may be plaintext or vault://env/KEY references. Merged with the deployment's existing env (incoming wins)."
+      ),
+  },
+  async ({ id, env }) => {
+    try {
+      if (Object.keys(env).length === 0) {
+        return textResult(
+          "No env vars supplied. Pass a non-empty 'env' map of KEY → value to merge."
+        );
+      }
+      const result = await client.updateDeployEnv(id, env);
+      const lines = [`Env vars merged into deployment ${id}.`];
+      if (result.note) lines.push(`Note: ${result.note}`);
+      const keys = Object.keys(result.env ?? {});
+      if (keys.length > 0) {
+        lines.push(``, `Current env (secret values redacted):`);
+        for (const k of keys.sort()) lines.push(`  ${k}=${result.env[k]}`);
+      }
+      lines.push(
+        ``,
+        `Redeploy to apply: create_deploy({ name, redeploy: true, tarball_base64 }) or redeploy({ id: "${id}", tarball_base64 }).`
+      );
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
+    }
+  }
+);
+
+// ── Tool: update_stack_env ────────────────────────────────────────────────────
+
+server.tool(
+  "update_stack_env",
+  `Merge environment variables into an existing stack
+(PATCH /stacks/:slug/env).
+
+Same merge semantics as update_deploy_env but for a multi-service stack, and
+transactionally row-locked server-side so concurrent updates don't clobber each
+other. An EMPTY-STRING value deletes that key. The response echoes the merged
+map with secret values redacted. Redeploy the stack
+(POST /stacks/:slug/redeploy) to apply the change.
+
+Auth required — anonymous stacks cannot be mutated (claim the stack first). A
+slug not on your team returns a clean 404. Requires INSTANODE_TOKEN.`,
+  {
+    stack_id: z
+      .string()
+      .min(1)
+      .describe(
+        "Stack id / slug (format stk-<8hex>, returned by create_stack as 'stack_id')."
+      ),
+    env: z
+      .record(z.string(), z.string())
+      .describe(
+        "Map of env var name → value to merge in. An empty-string value DELETES that key. Values may be plaintext or vault://env/KEY references."
+      ),
+  },
+  async ({ stack_id, env }) => {
+    try {
+      if (Object.keys(env).length === 0) {
+        return textResult(
+          "No env vars supplied. Pass a non-empty 'env' map of KEY → value to merge (use an empty-string value to delete a key)."
+        );
+      }
+      const result = await client.updateStackEnv(stack_id, env);
+      const lines = [`Env vars merged into stack ${stack_id}.`];
+      if (result.message) lines.push(`Note: ${result.message}`);
+      const keys = Object.keys(result.env ?? {});
+      if (keys.length > 0) {
+        lines.push(``, `Current env (secret values redacted):`);
+        for (const k of keys.sort()) lines.push(`  ${k}=${result.env[k]}`);
+      }
+      lines.push(
+        ``,
+        `Redeploy to apply (re-POST /stacks/${stack_id}/redeploy with the updated manifest + tarballs).`
+      );
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
+    }
+  }
+);
+
+// ── Tool: presign_storage ─────────────────────────────────────────────────────
+
+server.tool(
+  "presign_storage",
+  `Mint a short-lived presigned S3 URL for an object in a storage bucket prefix
+(POST /storage/:token/presign).
+
+Use this to upload (PUT) or download/inspect (GET/HEAD) an object without
+handing out long-lived credentials. The signed URL is scoped to the storage
+resource's tenant prefix and expires in ≤1h (default 10 min). Auth is the
+storage TOKEN in the path (the value create_storage returned) — so this works
+for anonymous-tier storage you just provisioned, no INSTANODE_TOKEN needed.
+
+Then use the returned 'url' with any plain HTTP client:
+  - PUT  → upload the object body to that URL
+  - GET  → download the object
+  - HEAD → fetch metadata only
+
+DELETE is intentionally NOT offered — a leaked presigned URL must not be able
+to wipe a prefix. The key must be relative to the prefix (no leading slash,
+no '..' path traversal — the api rejects those).`,
+  {
+    token: uuidSchema.describe(
+      "Storage resource token (UUID) returned by create_storage."
+    ),
+    operation: z
+      .enum(["GET", "PUT", "HEAD"])
+      .describe(
+        "S3 verb the signed URL authorises: GET (download), PUT (upload), or HEAD (metadata). DELETE is not permitted."
+      ),
+    key: z
+      .string()
+      .min(1)
+      .describe(
+        "Object key RELATIVE to the tenant prefix (e.g. 'uploads/avatar.png'). No leading slash, no '..' segments."
+      ),
+    expires_in: z
+      .number()
+      .int()
+      .positive()
+      .max(3600)
+      .optional()
+      .describe(
+        "TTL in seconds. Default 600 (10 min); capped server-side at 3600 (1h). Omit for the default."
+      ),
+  },
+  async ({ token, operation, key, expires_in }) => {
+    try {
+      const result = await client.presignStorage({
+        token,
+        operation,
+        key,
+        expires_in,
+      });
+      const lines = [
+        `Presigned ${result.method ?? operation} URL minted (expires ${result.expires_at}).`,
+        `Key:        ${result.key ?? key}`,
+        `Object key: ${result.object_key ?? key}`,
+        ``,
+        `URL (use with a plain HTTP client; treat as a secret until it expires):`,
+        result.url,
+      ];
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
+    }
+  }
+);
+
+// ── Tool: pause_resource ──────────────────────────────────────────────────────
+
+server.tool(
+  "pause_resource",
+  `Suspend a resource WITHOUT deleting it
+(POST /api/v1/resources/:id/pause).
+
+Storage is preserved and the connection URL is unchanged — the resource just
+stops accepting new connections (the provider-side credential is revoked) until
+you resume it. Use this to park a staging database overnight, freeze a resource
+during an incident, or temporarily cut access without losing data.
+
+Pro tier or higher only (anonymous/free/hobby get 402 with an upgrade prompt).
+Pausing an already-paused resource returns 409. Resume with resume_resource;
+the same connection URL works again immediately after resume.
+
+Requires INSTANODE_TOKEN. A token not on your team returns a clean 404.`,
+  {
+    id: uuidSchema.describe(
+      "Resource token (UUID) to pause — the value create_* returned as 'token'."
+    ),
+  },
+  async ({ id }) => {
+    try {
+      const result = await client.pauseResource(id);
+      const lines = [
+        `Resource paused.`,
+        `Token:  ${result.token ?? id}`,
+        `Status: ${result.status ?? "paused"}`,
+      ];
+      if (result.message) lines.push(`Message: ${result.message}`);
+      lines.push(``, `Resume with: resume_resource({ id: "${id}" }).`);
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
+    }
+  }
+);
+
+// ── Tool: resume_resource ─────────────────────────────────────────────────────
+
+server.tool(
+  "resume_resource",
+  `Un-pause a previously-paused resource
+(POST /api/v1/resources/:id/resume).
+
+Flips the resource back to 'active' and re-grants the provider credential. The
+connection URL is preserved unchanged (same password, host, database name) so
+your existing config keeps working — no reconnection-string change needed.
+
+Pro tier or higher only (symmetric with pause_resource). Resuming a resource
+that isn't paused returns 409. Requires INSTANODE_TOKEN. A token not on your
+team returns a clean 404.`,
+  {
+    id: uuidSchema.describe(
+      "Resource token (UUID) to resume — the value create_* returned as 'token'."
+    ),
+  },
+  async ({ id }) => {
+    try {
+      const result = await client.resumeResource(id);
+      const lines = [
+        `Resource resumed.`,
+        `Token:  ${result.token ?? id}`,
+        `Status: ${result.status ?? "active"}`,
+      ];
+      if (result.message) lines.push(`Message: ${result.message}`);
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
+    }
+  }
+);
+
+// ── Tool: rotate_credentials ──────────────────────────────────────────────────
+
+server.tool(
+  "rotate_credentials",
+  `Rotate a resource's password and get the NEW connection URL
+(POST /api/v1/resources/:id/rotate-credentials).
+
+The host and database name are unchanged; only the credential rotates. An
+attacker holding a leaked OLD connection URL is locked out, while the freshly-
+returned URL keeps working. Use this after a suspected leak, on a key-rotation
+schedule, or before handing a resource off.
+
+The response includes the new connection_url IN PLAINTEXT (the one place
+besides create_* that exposes it) — treat it as a secret, store it (e.g. with
+set_vault_key), and update any app/deploy that references the old URL.
+
+Requires INSTANODE_TOKEN. A token not on your team returns a clean 404.`,
+  {
+    id: uuidSchema.describe(
+      "Resource token (UUID) whose credentials to rotate — the value create_* returned as 'token'."
+    ),
+  },
+  async ({ id }) => {
+    try {
+      const result = await client.rotateCredentials(id);
+      const lines = [
+        `Credentials rotated for resource ${id}.`,
+        `The old connection URL no longer works. New connection URL (treat as a secret):`,
+        ``,
+        result.connection_url,
+        ``,
+        `Update any app/deploy that referenced the old URL. Consider storing this`,
+        `with set_vault_key and referencing it as vault://<env>/<key> in your deploys.`,
+      ];
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
+    }
+  }
+);
+
+// ── Tool: wake_deployment ─────────────────────────────────────────────────────
+
+server.tool(
+  "wake_deployment",
+  `Explicitly wake a scaled-to-zero deployment
+(POST /deploy/:id/wake).
+
+When scale-to-zero is enabled, an idle app is descheduled to 0 replicas to save
+compute; its URL then returns 502/503 (no pod) until woken. This tool scales it
+back to 1 replica and refreshes its activity stamp. The pod still needs its
+normal cold-start time before it serves traffic, so retry the app URL a few
+seconds after waking.
+
+This endpoint is FLAG-GATED on the platform: when scale-to-zero is disabled the
+api returns 501 'scale_to_zero_disabled' and nothing is scaled. That's expected
+on a deploy where the feature isn't turned on — the deployment is already
+always-on, so there's nothing to wake.
+
+Requires INSTANODE_TOKEN. A deployment id not on your team returns a clean 404.`,
+  {
+    id: uuidSchema.describe(
+      "Deployment app id (returned as 'deploy_id' by create_deploy / 'app_id' by get_deployment)."
+    ),
+  },
+  async ({ id }) => {
+    try {
+      const result = await client.wakeDeployment(id);
+      const lines = [`Deployment ${id} woken.`];
+      if (result.message) lines.push(result.message);
+      lines.push(
+        ``,
+        `Retry the app URL in a few seconds — the pod cold-starts before it serves traffic.`
+      );
       return textResult(lines.join("\n"));
     } catch (err) {
       return textResult(formatError(err));

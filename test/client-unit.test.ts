@@ -691,6 +691,134 @@ describe("InstantClient — unit-level branch coverage", () => {
     assert.match(url, /\/api\/v1\/deployments\/app%2Fwith%20slash$/);
   });
 
+  it("getCapabilities → GETs /api/v1/capabilities with NO auth required (auth-optional)", async () => {
+    let url = "";
+    let hadAuth = true;
+    stubFetch((input: any, init?: any) => {
+      url = String(input);
+      hadAuth = "Authorization" in (init?.headers ?? {});
+      return new Response(
+        JSON.stringify({ ok: true, tiers: [{ tier: "anonymous" }], docs: "d" }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    });
+    // No INSTANODE_TOKEN set — must still succeed (public discovery surface).
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    const r = await c.getCapabilities();
+    assert.match(url, /\/api\/v1\/capabilities$/);
+    assert.equal(hadAuth, false, "getCapabilities must not require/send a bearer");
+    assert.equal(r.tiers.length, 1);
+    assert.equal(r.tiers[0]?.tier, "anonymous");
+  });
+
+  it("getCapabilities → missing tiers field falls back to [] (defensive)", async () => {
+    stubFetch(() =>
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })
+    );
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    const r = await c.getCapabilities();
+    assert.deepEqual(r.tiers, []);
+  });
+
+  it("getDeploymentEvents → requires auth (AuthRequiredError when token unset)", async () => {
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    await assert.rejects(
+      () => c.getDeploymentEvents("dep-1"),
+      (err: unknown) => err instanceof AuthRequiredError
+    );
+  });
+
+  it("getDeploymentEvents → GETs /api/v1/deployments/:id/events (id URI-encoded), no limit param", async () => {
+    let url = "";
+    stubFetch((input: any) => {
+      url = String(input);
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          deployment_id: "uuid-1",
+          events: [{ kind: "failure_autopsy", reason: "OOMKilled", exit_code: 137, created_at: "2026-06-10T00:00:00Z" }],
+          count: 1,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    });
+    process.env["INSTANODE_TOKEN"] = "tok_xyz";
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    const r = await c.getDeploymentEvents("app/with slash");
+    assert.match(url, /\/api\/v1\/deployments\/app%2Fwith%20slash\/events$/);
+    assert.equal(r.count, 1);
+    assert.equal(r.events[0]?.reason, "OOMKilled");
+    assert.equal(r.events[0]?.exit_code, 137);
+  });
+
+  it("getDeploymentEvents → forwards a positive integer limit as ?limit=N", async () => {
+    let url = "";
+    stubFetch((input: any) => {
+      url = String(input);
+      return new Response(
+        JSON.stringify({ ok: true, deployment_id: "u", events: [], count: 0 }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    });
+    process.env["INSTANODE_TOKEN"] = "tok_xyz";
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    await c.getDeploymentEvents("dep-1", 5);
+    assert.match(url, /\/api\/v1\/deployments\/dep-1\/events\?limit=5$/);
+  });
+
+  it("getDeploymentEvents → non-positive / non-integer limit is dropped (no query param)", async () => {
+    let url = "";
+    stubFetch((input: any) => {
+      url = String(input);
+      return new Response(
+        JSON.stringify({ ok: true, deployment_id: "u", events: [], count: 0 }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    });
+    process.env["INSTANODE_TOKEN"] = "tok_xyz";
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    await c.getDeploymentEvents("dep-1", 0);
+    await c.getDeploymentEvents("dep-1", 2.5);
+    assert.doesNotMatch(url, /limit=/, "a zero / fractional limit must not be forwarded");
+  });
+
+  it("getDeploymentEvents → missing events + count fields fall back to [] / 0", async () => {
+    stubFetch(() =>
+      new Response(JSON.stringify({ deployment_id: "u" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })
+    );
+    process.env["INSTANODE_TOKEN"] = "tok_xyz";
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    const r = await c.getDeploymentEvents("dep-1");
+    assert.deepEqual(r.events, []);
+    assert.equal(r.count, 0);
+    assert.equal(r.ok, true); // ok ?? true fallback
+  });
+
+  it("getDeploymentEvents → count falls back to events.length when count is absent", async () => {
+    stubFetch(() =>
+      new Response(
+        JSON.stringify({
+          ok: true,
+          events: [
+            { kind: "failure_autopsy", reason: "A", exit_code: null, created_at: "x" },
+            { kind: "failure_autopsy", reason: "B", exit_code: null, created_at: "y" },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      )
+    );
+    process.env["INSTANODE_TOKEN"] = "tok_xyz";
+    const c = new InstantClient({ baseURL: "https://example.test" });
+    const r = await c.getDeploymentEvents("dep-1");
+    assert.equal(r.count, 2);
+  });
+
   it("deleteDeployment → DELETEs /deploy/:id and bubbles the body shape", async () => {
     let method = "";
     let url = "";

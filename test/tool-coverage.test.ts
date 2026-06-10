@@ -66,6 +66,18 @@ const MAPPED_TOOLS: Record<string, ToolMapping> = {
   get_deployment: { flow: "J17", endpoint: "GET /api/v1/deployments/:id" },
   redeploy: { flow: "J18", endpoint: "POST /deploy/:id/redeploy" },
   delete_deployment: { flow: "J19", endpoint: "DELETE /deploy/:id" },
+  get_capabilities: { flow: "J20", endpoint: "GET /api/v1/capabilities" },
+  get_deployment_events: { flow: "J21", endpoint: "GET /api/v1/deployments/:id/events" },
+  // ── operate tools (full-lifecycle, not just create) ──
+  set_vault_key: { flow: "J22", endpoint: "PUT /api/v1/vault/:env/:key" },
+  rotate_vault_key: { flow: "J23", endpoint: "POST /api/v1/vault/:env/:key/rotate" },
+  update_deploy_env: { flow: "J24", endpoint: "PATCH /deploy/:id/env" },
+  update_stack_env: { flow: "J25", endpoint: "PATCH /stacks/:slug/env" },
+  presign_storage: { flow: "J26", endpoint: "POST /storage/:token/presign" },
+  pause_resource: { flow: "J27", endpoint: "POST /api/v1/resources/:id/pause" },
+  resume_resource: { flow: "J28", endpoint: "POST /api/v1/resources/:id/resume" },
+  rotate_credentials: { flow: "J29", endpoint: "POST /api/v1/resources/:id/rotate-credentials" },
+  wake_deployment: { flow: "J30", endpoint: "POST /deploy/:id/wake" },
 };
 
 let registry: Record<string, { description?: string; inputSchema?: unknown; handler?: unknown }>;
@@ -103,11 +115,11 @@ before(async () => {
 });
 
 describe("MCP tool-coverage done-bar (drift guard, matrix §4.2)", () => {
-  it("registers exactly 19 tools (sanity vs matrix §1.J)", () => {
+  it("registers exactly 30 tools (sanity vs matrix §1.J)", () => {
     assert.equal(
       registeredNames.length,
-      19,
-      `expected 19 registered tools, got ${registeredNames.length}: ${registeredNames.join(", ")}`
+      30,
+      `expected 30 registered tools, got ${registeredNames.length}: ${registeredNames.join(", ")}`
     );
   });
 

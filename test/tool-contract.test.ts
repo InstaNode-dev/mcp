@@ -244,4 +244,150 @@ describe("endpoint contract — gap tools hit the correct J-row endpoint + shape
     // was reached and the response was mapped (not an error).
     assert.match(text, /deployment\(s\) on this team:|No deployments on this team yet/);
   });
+
+  it("J20 get_capabilities → GET /api/v1/capabilities (auth-OPTIONAL), returns the tier matrix", async () => {
+    // No token set (the beforeEach clears it) — the discovery surface must work
+    // for a cold-start agent. A populated tier list proves the public route was
+    // reached and mapped (not a 401).
+    delete process.env["INSTANODE_TOKEN"];
+    const res = await handlerFor("get_capabilities")({});
+    const text = flat(res);
+    assert.match(text, /tier\(s\) \(cheapest first\)/);
+    assert.match(text, /\[anonymous\]/);
+    assert.match(text, /\[team\].*\(top tier\)/);
+  });
+
+  it("J21 get_deployment_events → GET /api/v1/deployments/:id/events, failure autopsy", async () => {
+    process.env["INSTANODE_TOKEN"] = VALID_TOKEN;
+    // Seed a failing deployment so the events endpoint has rows to return.
+    const created = flat(
+      await handlerFor("create_deploy")({
+        tarball_base64: tarballBase64(),
+        name: "ctr-fail-deploy",
+      })
+    );
+    const appId = /Deploy ID:\s+(\S+)/.exec(created)![1];
+    const res = await handlerFor("get_deployment_events")({ id: appId });
+    const text = flat(res);
+    // A populated, shape-correct autopsy proves GET .../:id/events was reached.
+    assert.match(text, new RegExp(`event\\(s\\) for deployment ${appId}`));
+    assert.match(text, /failure_autopsy/);
+    assert.match(text, /hint:/);
+    // Clean up the deployment so the suite's leak sweep stays green.
+    await handlerFor("delete_deployment")({ id: appId });
+  });
+
+  it("J21 get_deployment_events → 401 on a missing bearer (auth-required, unlike J20)", async () => {
+    delete process.env["INSTANODE_TOKEN"];
+    const res = await handlerFor("get_deployment_events")({ id: UNKNOWN_UUID });
+    const text = flat(res);
+    assert.match(text, /requires authentication/i);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// operate-tools endpoint contract (J22-J30) — each new full-lifecycle tool
+// reaches its J-row endpoint and round-trips the documented shape, and the
+// auth/tier error envelopes map to the agent-facing block. A second copy of
+// the contract beyond operate-tools-unit.test.ts so the agent-facing error
+// surface (the P0 contract per CLAUDE.md) is pinned at the integration layer.
+// ───────────────────────────────────────────────────────────────────────────
+describe("operate-tools endpoint contract (J22-J30)", () => {
+  it("J22 set_vault_key → PUT /api/v1/vault/:env/:key, returns version", async () => {
+    process.env["INSTANODE_TOKEN"] = VALID_TOKEN;
+    const res = await handlerFor("set_vault_key")({
+      env: "production",
+      key: "CONTRACT_KEY",
+      value: "s3cr3t",
+    });
+    const text = flat(res);
+    assert.match(text, /Secret written to the vault/);
+    assert.match(text, /Version:\s+\d+/);
+    assert.match(text, /vault:\/\/production\/CONTRACT_KEY/);
+    // The plaintext value must never echo back.
+    assert.doesNotMatch(text, /s3cr3t/);
+  });
+
+  it("J23 rotate_vault_key → POST .../:env/:key/rotate, mints a new version", async () => {
+    process.env["INSTANODE_TOKEN"] = VALID_TOKEN;
+    await handlerFor("set_vault_key")({ env: "production", key: "ROT_K", value: "a" });
+    const res = await handlerFor("rotate_vault_key")({
+      env: "production",
+      key: "ROT_K",
+      value: "b",
+    });
+    assert.match(flat(res), /Vault secret rotated/);
+  });
+
+  it("J24 update_deploy_env → PATCH /deploy/:id/env on a seeded deployment", async () => {
+    process.env["INSTANODE_TOKEN"] = VALID_TOKEN;
+    const appId = mock.seedDeployment({ env: {} });
+    const res = await handlerFor("update_deploy_env")({ id: appId, env: { FOO: "bar" } });
+    assert.match(flat(res), new RegExp(`Env vars merged into deployment ${appId}`));
+  });
+
+  it("J25 update_stack_env → PATCH /stacks/:slug/env on a created stack", async () => {
+    const created = flat(
+      await handlerFor("create_stack")({
+        name: "ctr-stack-env",
+        manifest: "services:\n  web:\n    build: .\n    port: 8080\n    expose: true\n",
+        service_tarballs: { web: tarballBase64() },
+      })
+    );
+    const slug = /Stack ID:\s+(stk-[0-9a-f]{8})/.exec(created)![1];
+    process.env["INSTANODE_TOKEN"] = VALID_TOKEN;
+    const res = await handlerFor("update_stack_env")({ stack_id: slug, env: { K: "v" } });
+    assert.match(flat(res), new RegExp(`Env vars merged into stack ${slug}`));
+  });
+
+  it("J26 presign_storage → POST /storage/:token/presign (token-in-path auth)", async () => {
+    delete process.env["INSTANODE_TOKEN"];
+    const token = mock.seedResource({ resource_type: "storage", tier: "anonymous" });
+    const res = await handlerFor("presign_storage")({
+      token,
+      operation: "GET",
+      key: "report.csv",
+    });
+    const text = flat(res);
+    assert.match(text, /Presigned GET URL minted/);
+    assert.match(text, /X-Amz-Signature=mock/);
+  });
+
+  it("J27/J28 pause_resource then resume_resource → status round-trip (Pro)", async () => {
+    process.env["INSTANODE_TOKEN"] = VALID_TOKEN;
+    const token = mock.seedResource({ tier: "pro" });
+    assert.match(flat(await handlerFor("pause_resource")({ id: token })), /Status:\s+paused/);
+    assert.match(flat(await handlerFor("resume_resource")({ id: token })), /Status:\s+active/);
+  });
+
+  it("J27 pause_resource on hobby tier → 402 maps to Action + Upgrade block", async () => {
+    process.env["INSTANODE_TOKEN"] = HOBBY_TOKEN;
+    const token = mock.seedResource({ tier: "hobby" });
+    const text = flat(await handlerFor("pause_resource")({ id: token }));
+    assert.match(text, /402 tier_upgrade_required/);
+    assert.match(text, /\nAction: .*upgrade.*pricing/i);
+    assert.match(text, /\nUpgrade: https:\/\/instanode\.dev\/pricing/);
+  });
+
+  it("J29 rotate_credentials → POST .../rotate-credentials returns a fresh URL", async () => {
+    process.env["INSTANODE_TOKEN"] = VALID_TOKEN;
+    const token = mock.seedResource({ tier: "pro", resource_type: "postgres" });
+    const text = flat(await handlerFor("rotate_credentials")({ id: token }));
+    assert.match(text, /Credentials rotated/);
+    assert.match(text, /postgres:\/\/user:rotated_/);
+  });
+
+  it("J30 wake_deployment → 501 scale_to_zero_disabled when the flag is off (default)", async () => {
+    process.env["INSTANODE_TOKEN"] = VALID_TOKEN;
+    const appId = mock.seedDeployment({});
+    const text = flat(await handlerFor("wake_deployment")({ id: appId }));
+    assert.match(text, /501 scale_to_zero_disabled|not enabled/i);
+  });
+
+  it("J30 wake_deployment → success path when the flag is on", async () => {
+    process.env["INSTANODE_TOKEN"] = VALID_TOKEN;
+    const appId = mock.seedDeployment({ wakeEnabled: true });
+    const text = flat(await handlerFor("wake_deployment")({ id: appId }));
+    assert.match(text, new RegExp(`Deployment ${appId} woken`));
+  });
 });

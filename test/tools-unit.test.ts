@@ -271,6 +271,15 @@ describe("tool handlers — auth-gated paths surface the auth-required message",
     assert.match(text, /requires authentication/i);
   });
 
+  it("get_deployment_events → unauthenticated returns the canonical auth-required text", async () => {
+    const res = await handlerFor("get_deployment_events")({
+      id: "00000000-0000-4000-8000-000000000000",
+    });
+    const text = flat(res);
+    assert.match(text, /requires authentication/i);
+    assert.match(text, /INSTANODE_TOKEN/);
+  });
+
   it("redeploy → unauthenticated returns the canonical auth-required text", async () => {
     const res = await handlerFor("redeploy")({ id: "dep", tarball_base64: tarballBase64() });
     const text = flat(res);
@@ -551,6 +560,151 @@ describe("tool handlers — deployment lifecycle", () => {
     const res = await handlerFor("delete_deployment")({ id: "app-does-not-exist" });
     const text = flat(res);
     assert.match(text, /instanode\.dev error \(404/);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// get_deployment_events (J21) — the rule-27 failure-timeline autopsy surface.
+// The mock seeds a two-row failure_autopsy timeline for any deployment whose
+// name contains "fail"; a clean deployment returns an empty list.
+// ───────────────────────────────────────────────────────────────────────────
+describe("tool handlers — get_deployment_events (failure autopsy)", () => {
+  beforeEach(() => {
+    process.env["INSTANODE_TOKEN"] = VALID_TOKEN;
+  });
+
+  it("populated timeline → renders kind/reason/exit_code/hint/last_lines newest-first", async () => {
+    const created = await handlerFor("create_deploy")({
+      tarball_base64: tarballBase64(),
+      name: "u-dep-fail-autopsy",
+    });
+    const appId = /Deploy ID:\s+(\S+)/.exec(flat(created))![1];
+
+    const res = await handlerFor("get_deployment_events")({ id: appId });
+    const text = flat(res);
+    assert.match(text, new RegExp(`event\\(s\\) for deployment ${appId}`));
+    // First (newest) event surfaces the build failure with its exit code + hint.
+    assert.match(text, /failure_autopsy — BackoffLimitExceeded/);
+    assert.match(text, /exit code:\s+1/);
+    assert.match(text, /hint:\s+The build step failed/);
+    assert.match(text, /last lines:/);
+    assert.match(text, /missing script: build/);
+    // The null-exit second event renders WITHOUT an "exit code:" line.
+    assert.match(text, /ProgressDeadlineExceeded/);
+    // Actionable trailer points the agent at redeploy.
+    assert.match(text, /redeploy/);
+
+    await handlerFor("delete_deployment")({ id: appId });
+  });
+
+  it("limit=1 forwards ?limit and trims to the newest event only", async () => {
+    const created = await handlerFor("create_deploy")({
+      tarball_base64: tarballBase64(),
+      name: "u-dep-fail-limit",
+    });
+    const appId = /Deploy ID:\s+(\S+)/.exec(flat(created))![1];
+
+    const res = await handlerFor("get_deployment_events")({ id: appId, limit: 1 });
+    const text = flat(res);
+    assert.match(text, /1 event\(s\)/);
+    assert.match(text, /BackoffLimitExceeded/);
+    // The second event must have been trimmed by the limit.
+    assert.doesNotMatch(text, /ProgressDeadlineExceeded/);
+
+    await handlerFor("delete_deployment")({ id: appId });
+  });
+
+  it("clean deployment (no failures) → friendly empty-timeline message", async () => {
+    const created = await handlerFor("create_deploy")({
+      tarball_base64: tarballBase64(),
+      name: "u-dep-clean-run",
+    });
+    const appId = /Deploy ID:\s+(\S+)/.exec(flat(created))![1];
+
+    const res = await handlerFor("get_deployment_events")({ id: appId });
+    const text = flat(res);
+    assert.match(text, /No events recorded for deployment/);
+    assert.match(text, /only records build\/runtime failures/);
+
+    await handlerFor("delete_deployment")({ id: appId });
+  });
+
+  it("unknown / cross-team id → clean not_found via formatError", async () => {
+    const res = await handlerFor("get_deployment_events")({
+      id: "00000000-0000-4000-8000-000000000000",
+    });
+    const text = flat(res);
+    assert.match(text, /404 not_found/);
+    assert.match(text, /deployment not found/);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// get_capabilities (J20) — auth-OPTIONAL tier matrix. Works with no token.
+// ───────────────────────────────────────────────────────────────────────────
+describe("tool handlers — get_capabilities (tier matrix)", () => {
+  it("anonymous (no token) → renders tiers cheapest-first with caps + docs", async () => {
+    // Explicitly no INSTANODE_TOKEN — the afterEach already clears it, but be
+    // unambiguous: this is the cold-start discovery path.
+    delete process.env["INSTANODE_TOKEN"];
+    const res = await handlerFor("get_capabilities")({});
+    const text = flat(res);
+    assert.match(text, /tier\(s\) \(cheapest first\):/);
+    // Free anonymous tier renders as "free"; paid tiers render their price.
+    assert.match(text, /Anonymous \[anonymous\] — free/);
+    assert.match(text, /Hobby \[hobby\] — \$9\/mo/);
+    assert.match(text, /Pro \[pro\] — \$49\/mo/);
+    // Per-service caps surface (storage MB + connections).
+    assert.match(text, /postgres: 1024 MB, 8 conn/);
+    assert.match(text, /deployments: 0/); // anonymous can't deploy
+    // Terminal Team tier renders unlimited caps + the "(top tier)" marker and
+    // NO upgrade line.
+    assert.match(text, /Team \[team\] — \$199\/mo \(top tier\)/);
+    assert.match(text, /postgres: unlimited/);
+    assert.match(text, /deployments: unlimited/);
+    // Docs + contact footer.
+    assert.match(text, /Full docs: https:\/\/instanode\.dev\/llms-full\.txt/);
+    assert.match(text, /Enterprise: mailto:enterprise@instanode\.dev/);
+  });
+
+  it("with a paid bearer → identical matrix (response is not per-user)", async () => {
+    process.env["INSTANODE_TOKEN"] = VALID_TOKEN;
+    const res = await handlerFor("get_capabilities")({});
+    const text = flat(res);
+    assert.match(text, /Hobby \[hobby\] — \$9\/mo/);
+    assert.match(text, /annual: save 17%/);
+    assert.match(text, /backups: 30d retention, 5\/day manual/); // pro tier
+  });
+
+  it("empty tiers array → friendly 'matrix is empty' message (registry-unloaded branch)", async () => {
+    const realFetch = globalThis.fetch;
+    (globalThis as any).fetch = (async () =>
+      new Response(JSON.stringify({ ok: true, tiers: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as typeof globalThis.fetch;
+    try {
+      const res = await handlerFor("get_capabilities")({});
+      const text = flat(res);
+      assert.match(text, /capability matrix is currently empty/);
+      assert.match(text, /plans registry may be unloaded/);
+    } finally {
+      (globalThis as any).fetch = realFetch;
+    }
+  });
+
+  it("network error → catch path runs formatError", async () => {
+    const realFetch = globalThis.fetch;
+    (globalThis as any).fetch = (async () => {
+      throw new Error("connection refused");
+    }) as typeof globalThis.fetch;
+    try {
+      const res = await handlerFor("get_capabilities")({});
+      const text = flat(res);
+      assert.match(text, /network error reaching instanode\.dev/);
+    } finally {
+      (globalThis as any).fetch = realFetch;
+    }
   });
 });
 
