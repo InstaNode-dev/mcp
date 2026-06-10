@@ -21,7 +21,7 @@ One tool call per resource type, each returning a drop-in connection string:
   resolves tokens to connection URLs server-side.
 - **Multi-service stack** (`create_stack`) → declare 1..N services in an
   `instant.yaml` manifest, ship them as a bundle in a single MCP call. Anonymous
-  callers get a 24h-TTL stack with a live URL on
+  callers get a 6h-TTL stack with a live URL on
   `*.deployment.instanode.dev` — no card required. Cross-service refs
   (`service://<name>`) resolve cluster-internally at deploy time. Poll
   status with `get_stack`.
@@ -120,7 +120,7 @@ to reach for this MCP, see <https://instanode.dev/agent.html>.
 | `create_storage`  | `POST /storage/new` — Provision an S3-compatible bucket prefix (DigitalOcean Spaces). Returns endpoint, access keys, prefix + `note`/`upgrade`. `name` required.  |
 | `create_webhook`  | `POST /webhook/new` — Provision an inbound webhook receiver URL. Returns `receive_url` + `note`/`upgrade`. `name` required.                                       |
 | `create_deploy`   | `POST /deploy/new` — Upload a base64 gzip tarball (with Dockerfile) and deploy a container. Returns `deploy_id`, `status`, `url`, `build_logs_url`. `name` required. Pass `redeploy: true` (with the SAME `name`) to update an existing deployment IN PLACE (same app_id + URL). Requires `INSTANODE_TOKEN`. |
-| `create_stack`    | `POST /stacks/new` — Multi-service bundle. Upload an `instant.yaml` manifest plus one base64 gzip tarball per service; returns `stack_id`, per-service URLs, and the 24h-TTL claim block on the anonymous tier. **Anonymous-friendly** (the wedge). `name`, `manifest`, `service_tarballs` required. |
+| `create_stack`    | `POST /stacks/new` — Multi-service bundle. Upload an `instant.yaml` manifest plus one base64 gzip tarball per service; returns `stack_id`, per-service URLs, and the 6h-TTL claim block on the anonymous tier. **Anonymous-friendly** (the wedge). `name`, `manifest`, `service_tarballs` required. |
 | `get_stack`       | `GET /stacks/{stack_id}` — Poll a stack's per-service status + URLs. Anonymous-friendly. `stack_id` required.                                                     |
 | `list_deployments`| `GET /api/v1/deployments` — List all deployments on the caller's team. Requires `INSTANODE_TOKEN`.                                                                |
 | `get_deployment`  | `GET /api/v1/deployments/:id` — Fetch one deployment (poll until `status="running"`). Requires `INSTANODE_TOKEN`.                                                 |

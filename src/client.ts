@@ -121,6 +121,14 @@ export interface ProvisionResultBase {
   upgrade_jwt?: string;
   expires_at?: string | null;
   env?: string;
+  /**
+   * Unknown request-body fields the api silently dropped (api D7 / #283). When
+   * an agent sends a hallucinated param (e.g. `region`, `size`) the api ignores
+   * it and echoes the dropped key(s) here so the caller learns the param had no
+   * effect. Empty/absent on a clean request. Surfaced verbatim by the provision
+   * tools so the agent stops sending the dead field.
+   */
+  ignored_fields?: string[];
 }
 
 export interface DatabaseProvisionResult extends ProvisionResultBase {
@@ -597,7 +605,7 @@ export interface StackResult {
   env?: string;
   name?: string;
   services: StackService[];
-  /** Anonymous stacks have a 24h TTL; authenticated stacks return empty. */
+  /** Anonymous stacks have a 6h TTL; authenticated stacks return empty. */
   expires_in?: string;
   /** Anonymous-tier CTA fields, same semantics as create_*. */
   note?: string;
@@ -709,6 +717,21 @@ export class ApiError extends Error {
    * `upgradeURL` is the tier step (claimed → paid).
    */
   readonly claimURL?: string;
+  /**
+   * The `request_id` field every API error envelope carries — a support /
+   * log-correlation id. An agent or user can quote it when reporting a failure
+   * so the operator can grep it in the api logs. Previously the MCP discarded
+   * it entirely, so a failure was unattributable. Surfaced verbatim by
+   * formatError.
+   */
+  readonly requestId?: string;
+  /**
+   * The `retry_after_seconds` field present on rate-limit (429) and some
+   * transient-backpressure envelopes — the number of seconds the api asks the
+   * caller to wait before retrying. Surfaced so an agent backs off for the
+   * right duration instead of hammering or guessing.
+   */
+  readonly retryAfterSeconds?: number;
 
   constructor(
     status: number,
@@ -716,7 +739,9 @@ export class ApiError extends Error {
     code?: string,
     upgradeURL?: string,
     agentAction?: string,
-    claimURL?: string
+    claimURL?: string,
+    requestId?: string,
+    retryAfterSeconds?: number
   ) {
     super(message);
     this.name = "ApiError";
@@ -725,7 +750,56 @@ export class ApiError extends Error {
     this.upgradeURL = upgradeURL;
     this.agentAction = agentAction;
     this.claimURL = claimURL;
+    this.requestId = requestId;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
+}
+
+/**
+ * Build an ApiError from a parsed non-2xx response body.
+ *
+ * Single construction site for both `request<T>` and `requestMultipart<T>` so
+ * the set of fields lifted off the api's error envelope can never drift between
+ * the JSON and multipart code paths. The api's error envelope shape is
+ * `{ ok:false, error, message, agent_action?, upgrade_url?, claim_url?,
+ *    request_id, retry_after_seconds? }` (api/internal/handlers ErrorResponse).
+ *
+ * `request_id` is always present on a real api error; `retry_after_seconds` is
+ * present on 429 and transient-backpressure envelopes. Both are coerced
+ * defensively (a hostile/garbled body must not throw here) and only forwarded
+ * when they are the right shape.
+ */
+function apiErrorFromEnvelope(status: number, data: unknown): ApiError {
+  const err = (data ?? {}) as {
+    error?: string;
+    message?: string;
+    upgrade_url?: string;
+    agent_action?: string;
+    claim_url?: string;
+    request_id?: string;
+    retry_after_seconds?: number;
+  };
+  const message = err.message ?? "upstream error";
+  const requestId =
+    typeof err.request_id === "string" && err.request_id.length > 0
+      ? err.request_id
+      : undefined;
+  const retryAfterSeconds =
+    typeof err.retry_after_seconds === "number" &&
+    Number.isFinite(err.retry_after_seconds) &&
+    err.retry_after_seconds >= 0
+      ? err.retry_after_seconds
+      : undefined;
+  return new ApiError(
+    status,
+    message,
+    err.error,
+    err.upgrade_url,
+    err.agent_action,
+    err.claim_url,
+    requestId,
+    retryAfterSeconds
+  );
 }
 
 /**
@@ -865,22 +939,7 @@ export class InstantClient {
     }
 
     if (!resp.ok) {
-      const err = (data ?? {}) as {
-        error?: string;
-        message?: string;
-        upgrade_url?: string;
-        agent_action?: string;
-        claim_url?: string;
-      };
-      const message = err.message ?? "upstream error";
-      throw new ApiError(
-        resp.status,
-        message,
-        err.error,
-        err.upgrade_url,
-        err.agent_action,
-        err.claim_url
-      );
+      throw apiErrorFromEnvelope(resp.status, data);
     }
 
     // BugBash B16 F1 (regression of task #170 P0-1): empty 2xx bodies used to
@@ -944,22 +1003,7 @@ export class InstantClient {
     }
 
     if (!resp.ok) {
-      const err = (data ?? {}) as {
-        error?: string;
-        message?: string;
-        upgrade_url?: string;
-        agent_action?: string;
-        claim_url?: string;
-      };
-      const message = err.message ?? "upstream error";
-      throw new ApiError(
-        resp.status,
-        message,
-        err.error,
-        err.upgrade_url,
-        err.agent_action,
-        err.claim_url
-      );
+      throw apiErrorFromEnvelope(resp.status, data);
     }
 
     // Same empty-2xx safe sentinel as request<T>(). See the long comment up
@@ -1275,7 +1319,9 @@ export class InstantClient {
    *
    * Anonymous-friendly: like /deploy/new the api accepts anonymous callers
    * (OptionalAuth — openapi.json:157), issuing the stack at the anonymous tier
-   * with a 24h TTL. This is the CEO wedge: a single MCP call from a cold-start
+   * with a 6h TTL (anonymousStackTTL — a stack is live compute, so the window
+   * is tighter than the 24h anonymous RESOURCE TTL; api PR #214). This is the
+   * CEO wedge: a single MCP call from a cold-start
    * agent → live bundle URL on *.deployment.instanode.dev, no card, no
    * dashboard round-trip.
    *
@@ -1318,8 +1364,8 @@ export class InstantClient {
       form.append(serviceName, blob, `${serviceName}.tar.gz`);
     }
 
-    // /stacks/new is OptionalAuth — anonymous callers are accepted with a 24h
-    // TTL. Do NOT pass requireAuth here.
+    // /stacks/new is OptionalAuth — anonymous callers are accepted with a 6h
+    // TTL (anonymousStackTTL, api PR #214). Do NOT pass requireAuth here.
     return this.requestMultipart<StackResult>("/stacks/new", form);
   }
 
