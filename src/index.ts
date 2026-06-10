@@ -27,11 +27,18 @@
  *
  *   list_deployments   — list all deployments for the caller's team
  *   get_deployment     — fetch a deployment by app id (for polling build status)
+ *   get_deployment_events — read the failure-timeline autopsy (kind/reason/exit_code/
+ *                        hint/last_lines) for a deployment so the agent can
+ *                        self-correct a broken Dockerfile (auth required)
  *   redeploy           — push updated code to an existing deployment by id;
  *                        requires a fresh tarball (api never reuses the original).
  *                        Prefer `create_deploy({name, redeploy:true})` when you
  *                        have the name; use this when you only have the deploy id.
  *   delete_deployment  — tear down a running deployment
+ *
+ *   get_capabilities   — read the live per-tier capability matrix (storage /
+ *                        connection / deployment caps per tier) so an agent can
+ *                        plan a provision BEFORE a call 402s (auth optional)
  *
  * Every create_* tool surfaces the API's `note` and `upgrade` fields so the
  * agent can show the user the exact CTA + claim URL needed to keep the
@@ -59,6 +66,8 @@ import {
   InstantClient,
   type ProvisionLimits,
   type Resource,
+  type TierCapability,
+  type DeploymentEvent,
 } from "./client.js";
 import { nameSchema, NAME_PATTERN } from "./name_schema.js";
 
@@ -1486,6 +1495,94 @@ Requires INSTANODE_TOKEN.`,
   }
 );
 
+// ── Tool: get_deployment_events ───────────────────────────────────────────────
+
+server.tool(
+  "get_deployment_events",
+  `Read the failure-timeline autopsy for a deployment (GET /api/v1/deployments/:id/events).
+
+This is the rule-27 self-correction surface: when a deploy is stuck in
+"building" or flips to "failed", get_deployment only shows the LATEST error
+string — this tool returns the full chronological autopsy the platform's
+worker captured (Kaniko build failures, k8s pod events, OOM kills, image-pull
+errors). Each event carries:
+  - kind       (e.g. "failure_autopsy")
+  - reason     (e.g. "BackoffLimitExceeded", "OOMKilled", "ImagePullBackOff")
+  - exit_code  (process exit code, or null when not an exit)
+  - event      (k8s event type, when captured)
+  - last_lines (the tail of the build/pod log — usually the actual error)
+  - hint       (a remediation suggestion you can act on)
+  - created_at (RFC3339 UTC)
+
+Events are newest-first, so events[0] is the most recent failure. Use this to
+fix a broken Dockerfile or misconfigured port without guessing: read the hint
+and last_lines, patch the project, then redeploy.
+
+If the deploy succeeded there may be no events (empty list) — that's normal.
+
+Requires INSTANODE_TOKEN. A deployment id that isn't on your team returns a
+clean "not found" (the api never confirms other teams' deployments).`,
+  {
+    // BUG-MCP-025: validate UUID client-side, mirroring get_deployment.
+    id: uuidSchema.describe(
+      "Deployment app id (returned as 'deploy_id' by create_deploy / 'app_id' by get_deployment)."
+    ),
+    // Optional cap on rows returned. api default is 50, clamped server-side.
+    limit: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe(
+        "Max number of events to return (newest first). Optional — the api defaults to 50 and clamps to its own maximum. Omit to use the default."
+      ),
+  },
+  async ({ id, limit }) => {
+    try {
+      const result = await client.getDeploymentEvents(id, limit);
+      if (!result.events || result.events.length === 0) {
+        return textResult(
+          `No events recorded for deployment ${id}.\n\n` +
+            `This is normal for a deployment that built and is running cleanly — ` +
+            `the failure-timeline only records build/runtime failures. If the ` +
+            `deploy is stuck in "building", re-poll get_deployment and try ` +
+            `get_deployment_events again in a few seconds; the worker writes the ` +
+            `autopsy asynchronously once the failure is detected.`
+        );
+      }
+      const lines: string[] = [
+        `${result.count} event(s) for deployment ${id} (newest first):`,
+        "",
+      ];
+      result.events.forEach((ev: DeploymentEvent, i: number) => {
+        lines.push(`[${i + 1}] ${ev.kind}${ev.reason ? ` — ${ev.reason}` : ""}`);
+        if (ev.created_at) lines.push(`    when:       ${ev.created_at}`);
+        if (ev.event) lines.push(`    k8s event:  ${ev.event}`);
+        if (typeof ev.exit_code === "number") {
+          lines.push(`    exit code:  ${ev.exit_code}`);
+        }
+        if (ev.hint) lines.push(`    hint:       ${ev.hint}`);
+        if (ev.last_lines) {
+          // Render the log tail under its own indented heading so a multi-line
+          // blob stays visually grouped with its event.
+          lines.push(`    last lines:`);
+          for (const ll of ev.last_lines.split("\n")) {
+            lines.push(`      ${ll}`);
+          }
+        }
+        lines.push("");
+      });
+      lines.push(
+        `Act on the most recent event's hint + last_lines: patch your project, ` +
+          `then redeploy (create_deploy({ name, redeploy: true }) or redeploy({ id })).`
+      );
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
+    }
+  }
+);
+
 // ── Tool: redeploy ────────────────────────────────────────────────────────────
 
 server.tool(
@@ -1572,6 +1669,86 @@ Requires INSTANODE_TOKEN.`,
         `Status: ${result.status ?? "deleted"}`,
       ];
       if (result.message) lines.push(`Message: ${result.message}`);
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return textResult(formatError(err));
+    }
+  }
+);
+
+// ── Tool: get_capabilities ────────────────────────────────────────────────────
+
+server.tool(
+  "get_capabilities",
+  `Read the live per-tier capability matrix (GET /api/v1/capabilities).
+
+Use this BEFORE a provision/deploy call to plan around tier limits instead of
+provisioning-to-discover them and eating a 402 mid-flow. The api iterates its
+live plans registry, so the response is always current — tiers today are
+anonymous and free (both no-cost, 24h-TTL), then the paid tiers hobby ($9/mo),
+hobby_plus ($19/mo), pro ($49/mo), growth ($99/mo) and team ($199/mo). The
+exact numbers come from the api, not this description, so they never drift.
+
+Per tier you get:
+  - storage_limit_mb     — per-service storage cap (postgres/redis/mongodb/
+                           queue/storage/webhook/vector); -1 = unlimited
+  - connections_limit    — per-service max connections; -1 = unlimited
+  - resource_count_limit — per-service max number of active resources; -1 = unlimited
+  - deployments_apps     — max concurrent deployed apps; -1 = unlimited
+  - price_usd_monthly, paid_from_day_one, annual_discount_percent
+  - backup_retention_days / backup_restore_enabled / manual_backups_per_day
+  - rpo_minutes / rto_minutes (durability promise; 0 = not promised)
+  - upgrade_url (null on the terminal Team tier) + is_terminal_tier
+
+Tiers are returned in upgrade order (cheapest first). NO INSTANODE_TOKEN
+required — this is a public discovery surface so a cold-start agent can plan
+its first call. The response is the same for every caller.`,
+  {},
+  async () => {
+    try {
+      const result = await client.getCapabilities();
+      if (!result.tiers || result.tiers.length === 0) {
+        return textResult(
+          "The capability matrix is currently empty (the api returned no tiers). " +
+            "Retry shortly; if it persists the api's plans registry may be unloaded."
+        );
+      }
+      const lines: string[] = [
+        `${result.tiers.length} tier(s) (cheapest first):`,
+        "",
+      ];
+      const fmt = (n: number): string => (n < 0 ? "unlimited" : String(n));
+      for (const t of result.tiers as TierCapability[]) {
+        const price =
+          t.price_usd_monthly > 0 ? `$${t.price_usd_monthly}/mo` : "free";
+        const terminal = t.is_terminal_tier ? " (top tier)" : "";
+        lines.push(`${t.display_name ?? t.tier} [${t.tier}] — ${price}${terminal}`);
+        // Render the per-service storage + connection caps compactly.
+        const storage = t.storage_limit_mb ?? {};
+        const conns = t.connections_limit ?? {};
+        const services = Object.keys(storage);
+        if (services.length > 0) {
+          for (const svc of services) {
+            const s = fmt(storage[svc]);
+            const c = conns[svc] !== undefined ? `, ${fmt(conns[svc])} conn` : "";
+            lines.push(`    ${svc}: ${s === "unlimited" ? "unlimited" : `${s} MB`}${c}`);
+          }
+        }
+        lines.push(`    deployments: ${fmt(t.deployments_apps)}`);
+        if (t.backup_restore_enabled) {
+          lines.push(
+            `    backups: ${t.backup_retention_days}d retention, ` +
+              `${t.manual_backups_per_day}/day manual`
+          );
+        }
+        if (t.annual_discount_percent > 0) {
+          lines.push(`    annual: save ${t.annual_discount_percent}%`);
+        }
+        if (t.upgrade_url) lines.push(`    upgrade: ${t.upgrade_url}`);
+        lines.push("");
+      }
+      if (result.docs) lines.push(`Full docs: ${result.docs}`);
+      if (result.contact) lines.push(`Enterprise: ${result.contact}`);
       return textResult(lines.join("\n"));
     } catch (err) {
       return textResult(formatError(err));

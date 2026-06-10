@@ -257,6 +257,101 @@ export interface DeployDeleteResult {
 }
 
 /**
+ * One tier row from GET /api/v1/capabilities.
+ *
+ * Mirrors `tierCapabilities` in api/internal/handlers/capabilities.go. The
+ * handler iterates the live plans registry, so this shape is contract-stable
+ * but the SET of tiers is whatever api/plans.yaml ships. Today (2026-06):
+ * anonymous, free, hobby, hobby_plus, pro, growth, team.
+ *
+ * `storage_limit_mb` / `connections_limit` / `resource_count_limit` are keyed
+ * by service string ("postgres", "redis", "mongodb", "queue", "storage",
+ * "webhook", "vector"). A value of -1 means "unlimited"; a positive value is
+ * the hard cap (in MB for storage, count for connections / resource_count).
+ */
+export interface TierCapability {
+  tier: string;
+  display_name: string;
+  price_usd_monthly: number;
+  paid_from_day_one: boolean;
+  storage_limit_mb: Record<string, number>;
+  connections_limit: Record<string, number>;
+  resource_count_limit: Record<string, number>;
+  /** Max number of concurrent deployed apps. -1 = unlimited. */
+  deployments_apps: number;
+  backup_retention_days: number;
+  backup_restore_enabled: boolean;
+  manual_backups_per_day: number;
+  rpo_minutes: number;
+  rto_minutes: number;
+  annual_discount_percent: number;
+  /**
+   * Pricing-page URL for upgrading INTO a higher tier, or null on the terminal
+   * tier (Team today — nothing to upgrade to). Pairs with is_terminal_tier.
+   */
+  upgrade_url: string | null;
+  is_terminal_tier: boolean;
+}
+
+/**
+ * Response shape from GET /api/v1/capabilities (auth-optional, public).
+ *
+ * The api returns `{ ok, tiers, docs, contact }`. `tiers` is sorted ascending
+ * by upgrade rank (anonymous → team) so consumers see them in upgrade order.
+ */
+export interface CapabilitiesResult {
+  ok: boolean;
+  tiers: TierCapability[];
+  /** LLM-targeted full-docs URL (https://instanode.dev/llms-full.txt). */
+  docs?: string;
+  /** Enterprise contact mailto: link. */
+  contact?: string;
+}
+
+/**
+ * One row from GET /api/v1/deployments/:id/events — the failure-timeline
+ * autopsy surface (rule 27). Written by the worker's deploy_failure_autopsy
+ * job, read-only on the api. Mirrors the per-row shape emitted by
+ * DeployHandler.Events in api/internal/handlers/deploy.go.
+ *
+ * Most rows are kind="failure_autopsy" carrying a Kaniko/k8s failure reason
+ * plus the last lines of the build/pod log and a remediation hint. `exit_code`
+ * is null when the failure wasn't a process exit (e.g. ProgressDeadlineExceeded).
+ */
+export interface DeploymentEvent {
+  /** e.g. "failure_autopsy". */
+  kind: string;
+  /** e.g. "BackoffLimitExceeded", "OOMKilled", "ImagePullBackOff". */
+  reason: string;
+  /** k8s event type, when one was captured (e.g. "Warning"). */
+  event?: string;
+  /** Tail of the build/pod logs — the lines most likely to explain the failure. */
+  last_lines?: string;
+  /** Human-readable remediation suggestion the agent can act on. */
+  hint?: string;
+  /** Process exit code, or null when the failure wasn't an exit. */
+  exit_code: number | null;
+  /** RFC3339 UTC timestamp. */
+  created_at: string;
+}
+
+/**
+ * Response shape from GET /api/v1/deployments/:id/events.
+ *
+ * The api returns `{ ok, deployment_id, events, count }` with `events` ordered
+ * DESC by created_at (newest first). RBAC mirrors GET /deployments/:id exactly:
+ * a cross-team or absent id returns an indistinguishable 404 (never confirming
+ * existence of another team's deployment).
+ */
+export interface DeploymentEventsResult {
+  ok: boolean;
+  /** Internal deployment UUID (distinct from the public app_id in the path). */
+  deployment_id?: string;
+  events: DeploymentEvent[];
+  count: number;
+}
+
+/**
  * Response shape from POST /deploy/:id/redeploy.
  *
  * The live API documents this as a bare 202 with NO body (see openapi.json),
@@ -1186,5 +1281,65 @@ export class InstantClient {
       undefined,
       { requireAuth: true }
     );
+  }
+
+  /**
+   * GET /api/v1/capabilities — the live per-tier capability matrix.
+   *
+   * Auth-OPTIONAL (the api route is registered directly on the app, NOT under
+   * the RequireAuth group). An anonymous agent can read this to plan a call
+   * BEFORE provisioning-to-discover-limits — e.g. "is a 1 GB Mongo within the
+   * hobby cap, or do I need pro?" — instead of hitting a 402 mid-flow. With a
+   * bearer set the call still works identically (the response is the same for
+   * every caller; the tier matrix is not per-user). We therefore do NOT pass
+   * requireAuth — forcing a token here would defeat the whole point of a
+   * pre-flight discovery surface for cold-start agents.
+   *
+   * The response is cached `max-age=60` by the api (the matrix is immutable for
+   * the life of the running pod); callers that poll tighter than that get the
+   * edge-cached copy.
+   */
+  async getCapabilities(): Promise<CapabilitiesResult> {
+    const raw = await this.request<CapabilitiesResult>(
+      "GET",
+      "/api/v1/capabilities"
+    );
+    return { ...raw, tiers: raw.tiers ?? [] };
+  }
+
+  /**
+   * GET /api/v1/deployments/:id/events — the failure-timeline autopsy rows.
+   *
+   * Auth-REQUIRED (the route lives under the /api/v1 RequireAuth group). The
+   * `:id` is the public app_id (the same value emitted as `deploy_id` by
+   * create_deploy / `app_id` by get_deployment), NOT the internal UUID returned
+   * in the body's `deployment_id`. RBAC mirrors GET /deployments/:id: a
+   * cross-team or unknown id returns an indistinguishable 404 (the api never
+   * confirms the existence of another team's deployment).
+   *
+   * Optional `limit` is forwarded as a query param (api default 50, clamped to
+   * a max server-side). The api orders events DESC by created_at (newest first)
+   * so the most recent failure is `events[0]`.
+   */
+  async getDeploymentEvents(
+    id: string,
+    limit?: number
+  ): Promise<DeploymentEventsResult> {
+    let path = `/api/v1/deployments/${encodeURIComponent(id)}/events`;
+    if (typeof limit === "number" && Number.isInteger(limit) && limit > 0) {
+      path += `?limit=${limit}`;
+    }
+    const raw = await this.request<DeploymentEventsResult>(
+      "GET",
+      path,
+      undefined,
+      { requireAuth: true }
+    );
+    return {
+      ok: raw.ok ?? true,
+      deployment_id: raw.deployment_id,
+      events: raw.events ?? [],
+      count: typeof raw.count === "number" ? raw.count : (raw.events ?? []).length,
+    };
   }
 }

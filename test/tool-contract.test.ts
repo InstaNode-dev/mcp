@@ -244,4 +244,43 @@ describe("endpoint contract — gap tools hit the correct J-row endpoint + shape
     // was reached and the response was mapped (not an error).
     assert.match(text, /deployment\(s\) on this team:|No deployments on this team yet/);
   });
+
+  it("J20 get_capabilities → GET /api/v1/capabilities (auth-OPTIONAL), returns the tier matrix", async () => {
+    // No token set (the beforeEach clears it) — the discovery surface must work
+    // for a cold-start agent. A populated tier list proves the public route was
+    // reached and mapped (not a 401).
+    delete process.env["INSTANODE_TOKEN"];
+    const res = await handlerFor("get_capabilities")({});
+    const text = flat(res);
+    assert.match(text, /tier\(s\) \(cheapest first\)/);
+    assert.match(text, /\[anonymous\]/);
+    assert.match(text, /\[team\].*\(top tier\)/);
+  });
+
+  it("J21 get_deployment_events → GET /api/v1/deployments/:id/events, failure autopsy", async () => {
+    process.env["INSTANODE_TOKEN"] = VALID_TOKEN;
+    // Seed a failing deployment so the events endpoint has rows to return.
+    const created = flat(
+      await handlerFor("create_deploy")({
+        tarball_base64: tarballBase64(),
+        name: "ctr-fail-deploy",
+      })
+    );
+    const appId = /Deploy ID:\s+(\S+)/.exec(created)![1];
+    const res = await handlerFor("get_deployment_events")({ id: appId });
+    const text = flat(res);
+    // A populated, shape-correct autopsy proves GET .../:id/events was reached.
+    assert.match(text, new RegExp(`event\\(s\\) for deployment ${appId}`));
+    assert.match(text, /failure_autopsy/);
+    assert.match(text, /hint:/);
+    // Clean up the deployment so the suite's leak sweep stays green.
+    await handlerFor("delete_deployment")({ id: appId });
+  });
+
+  it("J21 get_deployment_events → 401 on a missing bearer (auth-required, unlike J20)", async () => {
+    delete process.env["INSTANODE_TOKEN"];
+    const res = await handlerFor("get_deployment_events")({ id: UNKNOWN_UUID });
+    const text = flat(res);
+    assert.match(text, /requires authentication/i);
+  });
 });

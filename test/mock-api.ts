@@ -132,10 +132,29 @@ export interface MockApiHandle {
   close(): Promise<void>;
 }
 
+/** A deployment_events autopsy row the mock surfaces via GET .../:id/events. */
+export interface MockDeploymentEvent {
+  kind: string;
+  reason: string;
+  event: string;
+  last_lines: string;
+  hint: string;
+  exit_code: number | null;
+  created_at: string;
+}
+
 interface State {
   resources: Map<string, MockResource>;
   deployments: Map<string, MockDeployment>;
   stacks: Map<string, MockStack>;
+  /**
+   * Per-app_id failure-timeline rows. Populated at deploy time for deployments
+   * whose name signals a failure (see the /deploy/new handler) so the
+   * GET /api/v1/deployments/:id/events tool can be exercised end-to-end. A
+   * deployment with no entry here returns an empty events list (the clean
+   * "built and running, no failures" path).
+   */
+  deploymentEvents: Map<string, MockDeploymentEvent[]>;
   provisionCalls: number;
   deployCalls: number;
   stackCalls: number;
@@ -320,6 +339,7 @@ export function startMockApi(): Promise<MockApiHandle> {
     resources: new Map(),
     deployments: new Map(),
     stacks: new Map(),
+    deploymentEvents: new Map(),
     provisionCalls: 0,
     deployCalls: 0,
     stackCalls: 0,
@@ -485,6 +505,97 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
       user_id: randomUUID(),
       session_token: `session.${randomUUID()}.jwt`,
       message: "Magic link sent to email",
+    });
+    return;
+  }
+
+  // ── GET /api/v1/capabilities ───────────────────────────────────────────────
+  // Public / auth-OPTIONAL — the real api registers this route directly on the
+  // app, NOT under the RequireAuth group (router.go:553). A cold-start agent
+  // reads it to plan a provision before a 402. The response is identical for
+  // every caller (the tier matrix is not per-user), so we ignore `authed`.
+  // Shape mirrors api/internal/handlers/capabilities.go: { ok, tiers[], docs,
+  // contact } with tiers sorted ascending by upgrade rank.
+  if (method === "GET" && path === "/api/v1/capabilities") {
+    sendJSON(res, 200, {
+      ok: true,
+      tiers: [
+        {
+          tier: "anonymous",
+          display_name: "Anonymous",
+          price_usd_monthly: 0,
+          paid_from_day_one: false,
+          storage_limit_mb: { postgres: 10, redis: 5, mongodb: 5 },
+          connections_limit: { postgres: 2, mongodb: 2 },
+          resource_count_limit: { postgres: 1, redis: 1, mongodb: 1 },
+          deployments_apps: 0,
+          backup_retention_days: 0,
+          backup_restore_enabled: false,
+          manual_backups_per_day: 0,
+          rpo_minutes: 0,
+          rto_minutes: 0,
+          annual_discount_percent: 0,
+          upgrade_url: "https://instanode.dev/pricing/",
+          is_terminal_tier: false,
+        },
+        {
+          tier: "hobby",
+          display_name: "Hobby",
+          price_usd_monthly: 9,
+          paid_from_day_one: true,
+          storage_limit_mb: { postgres: 1024, redis: 50, mongodb: 100 },
+          connections_limit: { postgres: 8, mongodb: 5 },
+          resource_count_limit: { postgres: 3, redis: 3, mongodb: 3 },
+          deployments_apps: 1,
+          backup_retention_days: 7,
+          backup_restore_enabled: true,
+          manual_backups_per_day: 1,
+          rpo_minutes: 1440,
+          rto_minutes: 30,
+          annual_discount_percent: 17,
+          upgrade_url: "https://instanode.dev/pricing/",
+          is_terminal_tier: false,
+        },
+        {
+          tier: "pro",
+          display_name: "Pro",
+          price_usd_monthly: 49,
+          paid_from_day_one: true,
+          storage_limit_mb: { postgres: 10240, redis: 512, mongodb: 5120 },
+          connections_limit: { postgres: 20, mongodb: 20 },
+          resource_count_limit: { postgres: 25, redis: 25, mongodb: 25 },
+          deployments_apps: 10,
+          backup_retention_days: 30,
+          backup_restore_enabled: true,
+          manual_backups_per_day: 5,
+          rpo_minutes: 60,
+          rto_minutes: 15,
+          annual_discount_percent: 17,
+          upgrade_url: "https://instanode.dev/pricing/",
+          is_terminal_tier: false,
+        },
+        {
+          tier: "team",
+          display_name: "Team",
+          price_usd_monthly: 199,
+          paid_from_day_one: true,
+          storage_limit_mb: { postgres: -1, redis: -1, mongodb: -1 },
+          connections_limit: { postgres: -1, mongodb: -1 },
+          resource_count_limit: { postgres: -1, redis: -1, mongodb: -1 },
+          deployments_apps: -1,
+          backup_retention_days: 90,
+          backup_restore_enabled: true,
+          manual_backups_per_day: 20,
+          rpo_minutes: 15,
+          rto_minutes: 10,
+          annual_discount_percent: 17,
+          // Terminal tier — nothing to upgrade to. Real api emits null here.
+          upgrade_url: null,
+          is_terminal_tier: true,
+        },
+      ],
+      docs: "https://instanode.dev/llms-full.txt",
+      contact: "mailto:enterprise@instanode.dev",
     });
     return;
   }
@@ -748,11 +859,81 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
       updated_at: nowIso(),
     };
     state.deployments.set(appId, deployment);
+    // Seed a failure-timeline autopsy for deployments whose name signals a
+    // failure ("fail" anywhere in the name). This lets the integration suite
+    // exercise the populated GET .../:id/events path end-to-end without a real
+    // Kaniko build. Newest-first, mirroring the real api's DESC ordering.
+    if (/fail/i.test(reqName)) {
+      state.deploymentEvents.set(appId, [
+        {
+          kind: "failure_autopsy",
+          reason: "BackoffLimitExceeded",
+          event: "Warning",
+          last_lines:
+            "Step 4/6 : RUN npm ci\n npm ERR! missing script: build\nThe command '/bin/sh -c npm ci' returned a non-zero code: 1",
+          hint: "The build step failed — check your Dockerfile's RUN commands and that package.json has the referenced scripts.",
+          exit_code: 1,
+          created_at: nowIso(),
+        },
+        {
+          kind: "failure_autopsy",
+          reason: "ProgressDeadlineExceeded",
+          event: "Warning",
+          last_lines: "Deployment exceeded its progress deadline",
+          hint: "The pod never became ready — verify the container listens on the declared port.",
+          exit_code: null,
+          created_at: nowIso(),
+        },
+      ]);
+    }
     state.deployCalls += 1;
     sendJSON(res, 202, {
       ok: true,
       item: deployment,
       note: "Build started — poll get_deployment until status=running.",
+    });
+    return;
+  }
+
+  // ── GET /api/v1/deployments/:id/events ─────────────────────────────────────
+  // MUST be matched BEFORE the generic "/api/v1/deployments/" prefix block
+  // below — otherwise the events path is swallowed by the single-deployment
+  // GET handler. Auth-REQUIRED (the real route lives under the /api/v1
+  // RequireAuth group; router.go:1175). RBAC mirrors GET /deployments/:id:
+  // a cross-team / unknown id returns an indistinguishable 404. Shape mirrors
+  // api/internal/handlers/deploy.go DeployHandler.Events:
+  // { ok, deployment_id, events[], count }.
+  if (
+    method === "GET" &&
+    path.startsWith("/api/v1/deployments/") &&
+    path.endsWith("/events")
+  ) {
+    if (!authed) {
+      sendJSON(res, 401, errorEnvelope({ error: "unauthorized", message: "bearer token required" }));
+      return;
+    }
+    const appId = decodeURIComponent(
+      path.slice("/api/v1/deployments/".length, path.length - "/events".length)
+    );
+    const deployment = state.deployments.get(appId);
+    if (!deployment || deployment.status === "deleted") {
+      // 404 (not 403) on absent/cross-team — never confirm existence.
+      sendJSON(res, 404, errorEnvelope({ error: "not_found", message: "deployment not found" }));
+      return;
+    }
+    let events = state.deploymentEvents.get(appId) ?? [];
+    // Honour ?limit=N — the real api clamps; the mock just slices to keep the
+    // newest N rows (events are stored newest-first).
+    const limitRaw = fullUrl.searchParams.get("limit");
+    if (limitRaw !== null) {
+      const lim = Number(limitRaw);
+      if (Number.isInteger(lim) && lim > 0) events = events.slice(0, lim);
+    }
+    sendJSON(res, 200, {
+      ok: true,
+      deployment_id: deployment.id,
+      events,
+      count: events.length,
     });
     return;
   }

@@ -124,6 +124,7 @@ to reach for this MCP, see <https://instanode.dev/agent.html>.
 | `get_stack`       | `GET /stacks/{stack_id}` — Poll a stack's per-service status + URLs. Anonymous-friendly. `stack_id` required.                                                     |
 | `list_deployments`| `GET /api/v1/deployments` — List all deployments on the caller's team. Requires `INSTANODE_TOKEN`.                                                                |
 | `get_deployment`  | `GET /api/v1/deployments/:id` — Fetch one deployment (poll until `status="running"`). Requires `INSTANODE_TOKEN`.                                                 |
+| `get_deployment_events` | `GET /api/v1/deployments/:id/events` — Read the failure-timeline autopsy for a deployment (`kind`/`reason`/`exit_code`/`event`/`last_lines`/`hint`/`created_at`, newest first) so an agent can self-correct a broken Dockerfile. Optional `limit`. Requires `INSTANODE_TOKEN`. |
 | `redeploy`        | `POST /deploy/:id/redeploy` — Push updated code to an existing deployment BY ID. Same URL, new build. Requires `tarball_base64` (same shape as `create_deploy`) — the api never reuses the original tarball. For the more common "update by name" path prefer `create_deploy({ name, redeploy: true, tarball_base64 })`. Requires `INSTANODE_TOKEN`. |
 | `delete_deployment` | `DELETE /deploy/:id` — Tear down a running deployment. Irreversible. Requires `INSTANODE_TOKEN`.                                                                |
 | `claim_resource`  | Helper — turn an `upgrade_jwt` from any `create_*` response into the dashboard claim URL the user should click. No API call. No auth required.                    |
@@ -131,6 +132,7 @@ to reach for this MCP, see <https://instanode.dev/agent.html>.
 | `list_resources`  | `GET /api/v1/resources` — List resources on the caller's account. Requires `INSTANODE_TOKEN`.                                                                     |
 | `delete_resource` | `DELETE /api/v1/resources/{token}` — Hard-delete a resource you own. Paid tier only. Requires `INSTANODE_TOKEN`.                                                  |
 | `get_api_token`   | `POST /api/v1/auth/api-keys` — Mint a fresh bearer Personal Access Token (PAT). Requires an existing user-session `INSTANODE_TOKEN` (PATs cannot mint other PATs — the API returns 403 in that case). |
+| `get_capabilities`| `GET /api/v1/capabilities` — Read the live per-tier capability matrix (storage / connection / resource-count / deployment caps, pricing, backup + RPO/RTO promises) in upgrade order so an agent can plan a provision before a call `402`s. **Auth optional** (public discovery surface). |
 
 ### Container deployment (`create_deploy`)
 
