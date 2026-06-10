@@ -368,6 +368,144 @@ export interface RedeployResult {
   message?: string;
 }
 
+/**
+ * Response shape from PUT /api/v1/vault/:env/:key and
+ * POST /api/v1/vault/:env/:key/rotate.
+ *
+ * Both return 201 `{ok, key, env, version}` (see VaultHandler.upsertSecret in
+ * api/internal/handlers/vault.go). Every write creates a NEW version (v1 on
+ * first create, v2+ on subsequent writes / rotates), so `version` is the
+ * authoritative "which generation did this call mint" signal. The plaintext
+ * secret value is NEVER echoed back — only its coordinates. This is the write
+ * side of the `vault://env/KEY` refs that create_deploy advertises: an agent
+ * can now write a secret here, then reference it as `vault://<env>/<key>` in a
+ * deploy's env_vars and the api decrypts it at deploy time (closes D4).
+ */
+export interface VaultWriteResult {
+  ok: boolean;
+  key: string;
+  env: string;
+  /** Version minted by this write. v1 = fresh create, v2+ = update/rotate. */
+  version: number;
+}
+
+/**
+ * Response shape from PATCH /deploy/:id/env (DeployHandler.UpdateEnv).
+ *
+ * The api MERGES the supplied keys into the deployment's existing env vars
+ * (incoming wins on collision) and returns the full merged map with secret
+ * values redacted (`env`), plus a `note` reminding the caller a redeploy is
+ * needed to apply the change. NOTE the route is `/deploy/:id/env`, NOT
+ * `/api/v1/deployments/:id/env` — the deployment env-mutation lives on the
+ * deploy group alongside /deploy/new.
+ */
+export interface UpdateDeployEnvResult {
+  ok: boolean;
+  /** Merged env map, values redacted. */
+  env: Record<string, string>;
+  note?: string;
+}
+
+/**
+ * Response shape from PATCH /stacks/:slug/env (StackHandler.UpdateEnv).
+ *
+ * Same load-merge-save semantics as the deploy variant but transactionally
+ * row-locked (MergeStackEnvVars) so concurrent PATCHes don't lose updates. An
+ * empty-string value DELETES that key. Returns the merged map (redacted) +
+ * a `message` reminding the caller to redeploy.
+ */
+export interface UpdateStackEnvResult {
+  ok: boolean;
+  env: Record<string, string>;
+  message?: string;
+}
+
+/**
+ * Response shape from POST /storage/:token/presign (StorageHandler.PresignStorage).
+ *
+ * Returns a short-lived (≤1h) presigned S3 URL scoped to the resource's tenant
+ * prefix. The `:token` is the storage token from create_storage; auth is the
+ * token in the URL (broker mode) so an anonymous caller can presign against a
+ * storage prefix it just provisioned. DELETE is intentionally NOT a permitted
+ * operation server-side (a leaked URL must not be able to wipe a prefix).
+ */
+export interface PresignStorageResult {
+  ok: boolean;
+  /** The signed S3 URL — usable with a plain HTTP client for the given method. */
+  url: string;
+  /** Echo of the resolved operation (GET / PUT / HEAD). */
+  method: string;
+  /** The object key relative to the tenant prefix. */
+  key: string;
+  /** The fully-qualified object key (prefix + key) the URL signs. */
+  object_key: string;
+  /** RFC3339 UTC expiry — the URL is invalid after this. */
+  expires_at: string;
+}
+
+/** Caller-supplied params for presign_storage. */
+export interface PresignStorageParams {
+  /** Storage resource token (UUID) from create_storage. */
+  token: string;
+  /** GET | PUT | HEAD — the S3 verb the signed URL authorises. */
+  operation: string;
+  /** Object key relative to the tenant prefix (no leading slash, no '..'). */
+  key: string;
+  /** TTL in seconds. Default 600, capped server-side at 3600 (1h). */
+  expires_in?: number;
+}
+
+/**
+ * Response shape from POST /api/v1/resources/:id/pause and
+ * POST /api/v1/resources/:id/resume (ResourceHandler.Pause/Resume).
+ *
+ * Pause suspends the resource WITHOUT deleting it: storage is preserved, the
+ * connection URL is unchanged, and the provider-side credential is revoked so
+ * new connections are refused until resume. Pro+ tier only (402 otherwise);
+ * already-paused → 409, already-active resume → 409. The `:id` is the resource
+ * TOKEN (the same value create_* emits as `token`).
+ */
+export interface ResourcePauseResumeResult {
+  ok: boolean;
+  id?: string;
+  token?: string;
+  status?: string;
+  message?: string;
+}
+
+/**
+ * Response shape from POST /api/v1/resources/:id/rotate-credentials
+ * (ResourceHandler.RotateCredentials).
+ *
+ * Rotates the resource's password and returns the NEW connection_url in
+ * plaintext — the one place (besides GetCredentials) the api exposes a
+ * connection string in cleartext. The host / database name are unchanged; only
+ * the credential rotates, so an attacker holding a leaked old URL is locked
+ * out while the new URL keeps working. Pro+ semantics mirror the live api.
+ */
+export interface RotateCredentialsResult {
+  ok: boolean;
+  /** The freshly-rotated connection string. Treat as a secret. */
+  connection_url: string;
+}
+
+/**
+ * Response shape from POST /deploy/:id/wake (DeployHandler.Wake).
+ *
+ * Scale-to-zero explicit wake: scales a (possibly scaled-to-zero) deployment
+ * back to 1 replica and refreshes its activity stamp. FLAG-GATED server-side by
+ * DEPLOY_SCALE_TO_ZERO_ENABLED — when the flag is OFF the api returns 501
+ * `scale_to_zero_disabled` and performs NO scaling / NO DB write. The pod still
+ * needs its normal cold-start before serving traffic, so a request racing the
+ * wake gets the app's cold-start latency (brief 502/503 from the ingress).
+ */
+export interface WakeDeploymentResult {
+  ok: boolean;
+  message?: string;
+  /** The refreshed deployment record (scaled_to_zero cleared). */
+  deployment?: Deployment;
+}
+
 /** Caller-supplied params for create_deploy. */
 export interface CreateDeployParams {
   /** Base64-encoded gzip tarball (with Dockerfile + source). <50 MB after decode. */
@@ -1341,5 +1479,180 @@ export class InstantClient {
       events: raw.events ?? [],
       count: typeof raw.count === "number" ? raw.count : (raw.events ?? []).length,
     };
+  }
+
+  /**
+   * PUT /api/v1/vault/:env/:key — write (always-new-version) a secret.
+   *
+   * The body is `{value}`; the api creates a fresh version on every call. Auth
+   * REQUIRED (vault is a paid-tier feature — hobby+ has 20 entries, pro/team
+   * unlimited; anonymous/free 403 `vault_not_available`). `env` and `key` are
+   * path params; we encode each segment so a key like `DATABASE_URL` (or a key
+   * containing a dot) round-trips cleanly. Returns `{ok, key, env, version}` —
+   * the plaintext value is never echoed back.
+   */
+  async setVaultKey(
+    env: string,
+    key: string,
+    value: string
+  ): Promise<VaultWriteResult> {
+    return this.request<VaultWriteResult>(
+      "PUT",
+      `/api/v1/vault/${encodeURIComponent(env)}/${encodeURIComponent(key)}`,
+      { value },
+      { requireAuth: true }
+    );
+  }
+
+  /**
+   * POST /api/v1/vault/:env/:key/rotate — rotate a secret's value.
+   *
+   * Functionally identical to setVaultKey (mints a new version) but exposed
+   * under a distinct audit action so the vault audit log distinguishes an
+   * intentional rotation from an ordinary write. Body `{value}` is the NEW
+   * secret value. Auth REQUIRED. Returns `{ok, key, env, version}`.
+   */
+  async rotateVaultKey(
+    env: string,
+    key: string,
+    value: string
+  ): Promise<VaultWriteResult> {
+    return this.request<VaultWriteResult>(
+      "POST",
+      `/api/v1/vault/${encodeURIComponent(env)}/${encodeURIComponent(key)}/rotate`,
+      { value },
+      { requireAuth: true }
+    );
+  }
+
+  /**
+   * PATCH /deploy/:id/env — merge env vars into an existing deployment.
+   *
+   * The `:id` is the public app_id. The api merges the supplied keys into the
+   * deployment's existing env (incoming wins) and returns the merged map with
+   * secret values redacted. Auth REQUIRED. A redeploy is needed to apply the
+   * change — the api's `note` says so and the tool surfaces it.
+   */
+  async updateDeployEnv(
+    id: string,
+    env: Record<string, string>
+  ): Promise<UpdateDeployEnvResult> {
+    const raw = await this.request<UpdateDeployEnvResult>(
+      "PATCH",
+      `/deploy/${encodeURIComponent(id)}/env`,
+      { env },
+      { requireAuth: true }
+    );
+    return { ok: raw.ok ?? true, env: raw.env ?? {}, note: raw.note };
+  }
+
+  /**
+   * PATCH /stacks/:slug/env — merge env vars into an existing stack.
+   *
+   * Transactionally row-locked server-side (no lost updates across concurrent
+   * PATCHes). An empty-string value DELETES that key. The `:slug` is the
+   * stack_id from create_stack. Auth REQUIRED (anonymous stacks cannot be
+   * mutated). Returns the merged map (redacted) + a redeploy reminder.
+   */
+  async updateStackEnv(
+    slug: string,
+    env: Record<string, string>
+  ): Promise<UpdateStackEnvResult> {
+    const raw = await this.request<UpdateStackEnvResult>(
+      "PATCH",
+      `/stacks/${encodeURIComponent(slug)}/env`,
+      { env },
+      { requireAuth: true }
+    );
+    return { ok: raw.ok ?? true, env: raw.env ?? {}, message: raw.message };
+  }
+
+  /**
+   * POST /storage/:token/presign — mint a short-lived presigned S3 URL.
+   *
+   * Auth is the storage token in the URL (broker mode), so this is NOT
+   * requireAuth: an anonymous caller can presign against a prefix it just
+   * provisioned. A session bearer, when set, is cross-checked server-side
+   * against the resource's team. Body carries `{operation, key, expires_in}`.
+   * Returns `{ok, url, method, key, object_key, expires_at}`.
+   */
+  async presignStorage(params: PresignStorageParams): Promise<PresignStorageResult> {
+    const body: { operation: string; key: string; expires_in?: number } = {
+      operation: params.operation,
+      key: params.key,
+    };
+    if (typeof params.expires_in === "number") body.expires_in = params.expires_in;
+    return this.request<PresignStorageResult>(
+      "POST",
+      `/storage/${encodeURIComponent(params.token)}/presign`,
+      body
+    );
+  }
+
+  /**
+   * POST /api/v1/resources/:id/pause — suspend a resource without deleting it.
+   *
+   * The `:id` is the resource token. Storage is preserved; the connection URL
+   * is unchanged; new connections are refused until resume. Pro+ only (402),
+   * already-paused → 409. Auth REQUIRED. The api returns a body carrying the
+   * flat fields plus a `resource` object; we surface the flat fields.
+   */
+  async pauseResource(token: string): Promise<ResourcePauseResumeResult> {
+    return this.request<ResourcePauseResumeResult>(
+      "POST",
+      `/api/v1/resources/${encodeURIComponent(token)}/pause`,
+      undefined,
+      { requireAuth: true }
+    );
+  }
+
+  /**
+   * POST /api/v1/resources/:id/resume — un-pause a previously-paused resource.
+   *
+   * Flips status back to 'active' and re-grants the provider credential. The
+   * connection URL is preserved unchanged so the customer's config still works.
+   * Pro+ only (402), not-paused → 409. Auth REQUIRED.
+   */
+  async resumeResource(token: string): Promise<ResourcePauseResumeResult> {
+    return this.request<ResourcePauseResumeResult>(
+      "POST",
+      `/api/v1/resources/${encodeURIComponent(token)}/resume`,
+      undefined,
+      { requireAuth: true }
+    );
+  }
+
+  /**
+   * POST /api/v1/resources/:id/rotate-credentials — rotate a resource password.
+   *
+   * Returns the NEW connection_url in plaintext (host + database name unchanged;
+   * only the credential rotates). An attacker holding the old leaked URL is
+   * locked out; the new URL keeps working. Auth REQUIRED. Treat the returned
+   * connection_url as a secret.
+   */
+  async rotateCredentials(token: string): Promise<RotateCredentialsResult> {
+    return this.request<RotateCredentialsResult>(
+      "POST",
+      `/api/v1/resources/${encodeURIComponent(token)}/rotate-credentials`,
+      undefined,
+      { requireAuth: true }
+    );
+  }
+
+  /**
+   * POST /deploy/:id/wake — explicitly wake a scaled-to-zero deployment.
+   *
+   * FLAG-GATED server-side (DEPLOY_SCALE_TO_ZERO_ENABLED): when the flag is OFF
+   * the api returns 501 `scale_to_zero_disabled` and the tool surfaces that
+   * verbatim. When ON, scales the app back to 1 replica + refreshes the
+   * activity stamp. Auth REQUIRED. The pod still cold-starts before serving.
+   */
+  async wakeDeployment(id: string): Promise<WakeDeploymentResult> {
+    return this.request<WakeDeploymentResult>(
+      "POST",
+      `/deploy/${encodeURIComponent(id)}/wake`,
+      undefined,
+      { requireAuth: true }
+    );
   }
 }

@@ -128,6 +128,23 @@ export interface MockApiHandle {
   deployCount(): number;
   /** Total count of /stacks/new calls received. */
   stackCount(): number;
+  /**
+   * Directly seed a resource row (bypassing the provision flow) so a test can
+   * deterministically set up a pro-tier / paused / specific-type resource to
+   * drive pause/resume/rotate/presign against. Returns the resource token.
+   */
+  seedResource(opts?: Partial<MockResource>): string;
+  /**
+   * Directly seed a deployment row so a test can drive update_deploy_env /
+   * wake_deployment against a known app_id. Pass `wakeEnabled:true` to flip the
+   * mock's scale-to-zero flag ON for this deployment (the wake success path).
+   * Returns the app_id.
+   */
+  seedDeployment(opts?: Partial<MockDeployment> & { wakeEnabled?: boolean }): string;
+  /** Read the current env map a stack carries (post-PATCH). */
+  stackEnvFor(slug: string): Record<string, string> | undefined;
+  /** Read the current env map a deployment carries (post-PATCH). */
+  deployEnvFor(appId: string): Record<string, string> | undefined;
   /** Shut the server down. */
   close(): Promise<void>;
 }
@@ -155,6 +172,18 @@ interface State {
    * "built and running, no failures" path).
    */
   deploymentEvents: Map<string, MockDeploymentEvent[]>;
+  /**
+   * Vault store, keyed "<env>/<key>" → current version. PUT and POST-rotate
+   * both bump the version (v1 on first write). Mirrors the live api's
+   * always-new-version semantics (VaultHandler.upsertSecret).
+   */
+  vault: Map<string, number>;
+  /**
+   * Per-stack-slug env-var map. The live api persists stack env into
+   * stacks.env_vars JSONB; the mock keeps it here so PATCH /stacks/:slug/env
+   * can demonstrate the load-merge-save (including empty-string delete).
+   */
+  stackEnv: Map<string, Record<string, string>>;
   provisionCalls: number;
   deployCalls: number;
   stackCalls: number;
@@ -340,6 +369,8 @@ export function startMockApi(): Promise<MockApiHandle> {
     deployments: new Map(),
     stacks: new Map(),
     deploymentEvents: new Map(),
+    vault: new Map(),
+    stackEnv: new Map(),
     provisionCalls: 0,
     deployCalls: 0,
     stackCalls: 0,
@@ -372,6 +403,48 @@ export function startMockApi(): Promise<MockApiHandle> {
         provisionCount: () => state.provisionCalls,
         deployCount: () => state.deployCalls,
         stackCount: () => state.stackCalls,
+        seedResource: (opts) => {
+          const token = opts?.token ?? randomUUID();
+          const resource: MockResource = {
+            id: opts?.id ?? randomUUID(),
+            token,
+            resource_type: opts?.resource_type ?? "postgres",
+            tier: opts?.tier ?? "pro",
+            status: opts?.status ?? "active",
+            name: opts?.name ?? "seeded-resource",
+            created_at: opts?.created_at ?? nowIso(),
+            expires_at: opts?.expires_at ?? null,
+          };
+          state.resources.set(token, resource);
+          return token;
+        },
+        seedDeployment: (opts) => {
+          const appId = opts?.app_id ?? randomUUID();
+          const env = { ...(opts?.env ?? {}) };
+          if (opts?.wakeEnabled) env["_wake_enabled"] = "1";
+          const deployment: MockDeployment = {
+            id: opts?.id ?? randomUUID(),
+            app_id: appId,
+            token: appId,
+            port: opts?.port ?? 8080,
+            tier: opts?.tier ?? "pro",
+            status: opts?.status ?? "running",
+            url: opts?.url ?? `https://${appId}.deployment.instanode.dev`,
+            env,
+            environment: opts?.environment ?? "production",
+            private: opts?.private ?? false,
+            allowed_ips: opts?.allowed_ips ?? [],
+            created_at: opts?.created_at ?? nowIso(),
+            updated_at: opts?.updated_at ?? nowIso(),
+          };
+          state.deployments.set(appId, deployment);
+          return appId;
+        },
+        stackEnvFor: (slug) => state.stackEnv.get(slug),
+        deployEnvFor: (appId) => {
+          const d = state.deployments.get(appId);
+          return d ? { ...d.env } : undefined;
+        },
         close: () =>
           new Promise<void>((closeResolve, closeReject) => {
             // Drop any keep-alive sockets so close() resolves promptly even
@@ -1229,6 +1302,334 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
       body["note"] = "Anonymous stack — expires in 24h.";
     }
     sendJSON(res, 200, body);
+    return;
+  }
+
+  // ── PUT /api/v1/vault/:env/:key  and  POST /api/v1/vault/:env/:key/rotate ───
+  // Mirrors VaultHandler.upsertSecret: always-new-version write, 201
+  // {ok, key, env, version}. Auth required; the plaintext value is never
+  // echoed back. The mock keeps a per-(env,key) version counter so a write
+  // returns v1 and a subsequent write/rotate returns v2+ — exercising the
+  // "version reflects which generation this call minted" contract.
+  {
+    const vaultPut = method === "PUT" && /^\/api\/v1\/vault\/[^/]+\/[^/]+$/.test(path);
+    const vaultRotate =
+      method === "POST" && /^\/api\/v1\/vault\/[^/]+\/[^/]+\/rotate$/.test(path);
+    if (vaultPut || vaultRotate) {
+      if (!authed) {
+        sendJSON(res, 401, errorEnvelope({ error: "unauthorized", message: "bearer token required" }));
+        return;
+      }
+      // Vault is a paid feature; the hobby fixture still has it (20 entries),
+      // so any authed caller passes here. A real anonymous caller never has a
+      // bearer, so the 401 above already covers the vault_not_available case.
+      const rest = path.slice("/api/v1/vault/".length);
+      const segs = (vaultRotate ? rest.slice(0, -"/rotate".length) : rest).split("/");
+      const env = decodeURIComponent(segs[0]);
+      const key = decodeURIComponent(segs[1]);
+      const raw = await readBody(req);
+      let parsed: { value?: unknown } = {};
+      try {
+        parsed = raw.length > 0 ? JSON.parse(raw.toString("utf8")) : {};
+      } catch {
+        sendJSON(res, 400, errorEnvelope({ error: "invalid_body", message: "malformed JSON body" }));
+        return;
+      }
+      if (typeof parsed.value !== "string" || parsed.value.length === 0) {
+        sendJSON(res, 400, errorEnvelope({ error: "invalid_value", message: "value is required" }));
+        return;
+      }
+      const vk = `${env}/${key}`;
+      const nextVersion = (state.vault.get(vk) ?? 0) + 1;
+      state.vault.set(vk, nextVersion);
+      sendJSON(res, 201, { ok: true, key, env, version: nextVersion });
+      return;
+    }
+  }
+
+  // ── PATCH /deploy/:id/env ───────────────────────────────────────────────────
+  // Mirrors DeployHandler.UpdateEnv: merge incoming env into the deployment's
+  // existing env (incoming wins), persist, return the redacted merged map + a
+  // redeploy note. Auth required; cross-team / unknown id → 404.
+  if (method === "PATCH" && /^\/deploy\/[^/]+\/env$/.test(path)) {
+    if (!authed) {
+      sendJSON(res, 401, errorEnvelope({ error: "unauthorized", message: "bearer token required" }));
+      return;
+    }
+    const id = decodeURIComponent(path.slice("/deploy/".length, path.length - "/env".length));
+    const deployment = [...state.deployments.values()].find(
+      (d) => d.app_id === id && d.status !== "deleted"
+    );
+    if (!deployment) {
+      sendJSON(res, 404, errorEnvelope({ error: "not_found", message: "deployment not found" }));
+      return;
+    }
+    const raw = await readBody(req);
+    let parsed: { env?: unknown } = {};
+    try {
+      parsed = raw.length > 0 ? JSON.parse(raw.toString("utf8")) : {};
+    } catch {
+      sendJSON(res, 400, errorEnvelope({ error: "invalid_body", message: "malformed JSON body" }));
+      return;
+    }
+    if (
+      typeof parsed.env !== "object" ||
+      parsed.env === null ||
+      Object.keys(parsed.env as Record<string, unknown>).length === 0
+    ) {
+      sendJSON(res, 400, errorEnvelope({ error: "missing_env", message: "env must be a non-empty object" }));
+      return;
+    }
+    for (const [k, v] of Object.entries(parsed.env as Record<string, string>)) {
+      deployment.env[k] = String(v);
+    }
+    // Redact for the response, mirroring the api (raw values stay stored).
+    const redacted: Record<string, string> = {};
+    for (const k of Object.keys(deployment.env)) {
+      if (k.startsWith("_")) continue; // mock-internal markers (e.g. _name)
+      redacted[k] = "***";
+    }
+    sendJSON(res, 200, {
+      ok: true,
+      note: `Env vars updated. Run POST /deploy/${id}/redeploy to apply changes.`,
+      env: redacted,
+    });
+    return;
+  }
+
+  // ── PATCH /stacks/:slug/env ─────────────────────────────────────────────────
+  // Mirrors StackHandler.UpdateEnv: row-locked merge, empty-string value
+  // deletes a key, returns the redacted merged map + a redeploy message. Auth
+  // required (anonymous stacks cannot be mutated); cross-team / unknown → 404.
+  if (method === "PATCH" && /^\/stacks\/[^/]+\/env$/.test(path)) {
+    if (!authed) {
+      sendJSON(res, 401, errorEnvelope({ error: "unauthorized", message: "bearer token required" }));
+      return;
+    }
+    const slug = decodeURIComponent(path.slice("/stacks/".length, path.length - "/env".length));
+    const stack = state.stacks.get(slug);
+    if (!stack || stack.status === "deleted") {
+      sendJSON(res, 404, errorEnvelope({ error: "not_found", message: "stack not found" }));
+      return;
+    }
+    const raw = await readBody(req);
+    let parsed: { env?: unknown } = {};
+    try {
+      parsed = raw.length > 0 ? JSON.parse(raw.toString("utf8")) : {};
+    } catch {
+      sendJSON(res, 400, errorEnvelope({ error: "invalid_body", message: "malformed JSON body" }));
+      return;
+    }
+    if (
+      typeof parsed.env !== "object" ||
+      parsed.env === null ||
+      Object.keys(parsed.env as Record<string, unknown>).length === 0
+    ) {
+      sendJSON(res, 400, errorEnvelope({ error: "missing_env", message: "env must be a non-empty object" }));
+      return;
+    }
+    const merged: Record<string, string> = { ...(state.stackEnv.get(slug) ?? {}) };
+    for (const [k, v] of Object.entries(parsed.env as Record<string, string>)) {
+      if (v === "") delete merged[k];
+      else merged[k] = String(v);
+    }
+    state.stackEnv.set(slug, merged);
+    const redacted: Record<string, string> = {};
+    for (const k of Object.keys(merged)) redacted[k] = "***";
+    sendJSON(res, 200, {
+      ok: true,
+      env: redacted,
+      message: `Env vars persisted. Call POST /stacks/${slug}/redeploy to apply.`,
+    });
+    return;
+  }
+
+  // ── POST /storage/:token/presign ────────────────────────────────────────────
+  // Mirrors StorageHandler.PresignStorage: token-in-path auth (broker mode, no
+  // bearer required), allow-list of GET/PUT/HEAD, returns a signed URL +
+  // {method, key, object_key, expires_at}. The token must map to a live storage
+  // resource; an unknown token → 404 (the mock 404s indistinguishably).
+  if (method === "POST" && /^\/storage\/[^/]+\/presign$/.test(path)) {
+    const token = decodeURIComponent(
+      path.slice("/storage/".length, path.length - "/presign".length)
+    );
+    const resource = state.resources.get(token);
+    if (!resource || resource.status === "deleted" || resource.resource_type !== "storage") {
+      sendJSON(res, 404, errorEnvelope({ error: "not_found", message: "storage resource not found" }));
+      return;
+    }
+    const raw = await readBody(req);
+    let parsed: { operation?: unknown; key?: unknown; expires_in?: unknown } = {};
+    try {
+      parsed = raw.length > 0 ? JSON.parse(raw.toString("utf8")) : {};
+    } catch {
+      sendJSON(res, 400, errorEnvelope({ error: "invalid_body", message: "malformed JSON body" }));
+      return;
+    }
+    const op = String(parsed.operation ?? "").toUpperCase();
+    if (op !== "GET" && op !== "PUT" && op !== "HEAD") {
+      sendJSON(res, 400, errorEnvelope({ error: "invalid_operation", message: "operation must be one of GET, PUT, HEAD" }));
+      return;
+    }
+    if (typeof parsed.key !== "string" || parsed.key.length === 0) {
+      sendJSON(res, 400, errorEnvelope({ error: "invalid_key", message: "key is required" }));
+      return;
+    }
+    if (parsed.key.includes("..") || parsed.key.startsWith("/")) {
+      sendJSON(res, 400, errorEnvelope({ error: "path_unsafe", message: "key must not contain '..' or a leading slash" }));
+      return;
+    }
+    let ttl = typeof parsed.expires_in === "number" && parsed.expires_in > 0 ? parsed.expires_in : 600;
+    if (ttl > 3600) ttl = 3600;
+    const prefix = `prefix-${token.slice(0, 8)}`;
+    const objectKey = `${prefix}/${parsed.key}`;
+    const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
+    sendJSON(res, 200, {
+      ok: true,
+      url: `https://nyc3.mock-spaces.com/instant-shared/${objectKey}?X-Amz-Signature=mock&X-Amz-Expires=${ttl}`,
+      method: op,
+      key: parsed.key,
+      object_key: objectKey,
+      expires_at: expiresAt,
+    });
+    return;
+  }
+
+  // ── POST /api/v1/resources/:id/{pause,resume} ───────────────────────────────
+  // Mirrors ResourceHandler.Pause/Resume: Pro+ tier gate, status flip with a
+  // 409 on the already-in-that-state no-op, connection URL preserved. The mock
+  // keys tier off the resource row (provisionResponse stamps tier from auth):
+  // hobby-tier resources hit the 402 gate, pro-tier flip cleanly.
+  {
+    const pauseMatch = /^\/api\/v1\/resources\/([^/]+)\/(pause|resume)$/.exec(path);
+    if (method === "POST" && pauseMatch) {
+      if (!authed) {
+        sendJSON(res, 401, errorEnvelope({ error: "unauthorized", message: "bearer token required" }));
+        return;
+      }
+      const token = decodeURIComponent(pauseMatch[1]);
+      const action = pauseMatch[2]; // "pause" | "resume"
+      const resource = state.resources.get(token);
+      if (!resource || resource.status === "deleted") {
+        sendJSON(res, 404, errorEnvelope({ error: "not_found", message: "resource not found" }));
+        return;
+      }
+      // Tier gate: pause/resume is Pro+ (multiEnvTierAllowed). The mock's
+      // pro fixture stamps tier="pro"; hobby stamps "hobby" → 402.
+      if (resource.tier !== "pro" && resource.tier !== "team" && resource.tier !== "growth") {
+        sendJSON(
+          res,
+          402,
+          errorEnvelope({
+            error: "tier_upgrade_required",
+            message: "Pause/resume requires Pro tier or higher.",
+            agent_action:
+              "Tell the user pause/resume is a Pro-tier feature — have them upgrade at https://instanode.dev/pricing.",
+            upgrade_url: "https://instanode.dev/pricing",
+          })
+        );
+        return;
+      }
+      if (action === "pause") {
+        if (resource.status === "paused") {
+          sendJSON(res, 409, errorEnvelope({ error: "already_paused", message: "Resource is already paused." }));
+          return;
+        }
+        resource.status = "paused";
+        sendJSON(res, 200, {
+          ok: true,
+          id: resource.id,
+          token: resource.token,
+          status: "paused",
+          message: "Resource paused. Storage is preserved and the connection URL is unchanged.",
+        });
+        return;
+      }
+      // resume
+      if (resource.status !== "paused") {
+        sendJSON(res, 409, errorEnvelope({ error: "not_paused", message: "Resource is not paused." }));
+        return;
+      }
+      resource.status = "active";
+      sendJSON(res, 200, {
+        ok: true,
+        id: resource.id,
+        token: resource.token,
+        status: "active",
+        message: "Resource resumed. The connection URL is unchanged.",
+      });
+      return;
+    }
+  }
+
+  // ── POST /api/v1/resources/:id/rotate-credentials ───────────────────────────
+  // Mirrors ResourceHandler.RotateCredentials: returns the NEW connection_url
+  // in plaintext (host + db unchanged, only the credential rotates). Auth
+  // required; cross-team / unknown → 404.
+  if (method === "POST" && /^\/api\/v1\/resources\/[^/]+\/rotate-credentials$/.test(path)) {
+    if (!authed) {
+      sendJSON(res, 401, errorEnvelope({ error: "unauthorized", message: "bearer token required" }));
+      return;
+    }
+    const token = decodeURIComponent(
+      path.slice("/api/v1/resources/".length, path.length - "/rotate-credentials".length)
+    );
+    const resource = state.resources.get(token);
+    if (!resource || resource.status === "deleted") {
+      sendJSON(res, 404, errorEnvelope({ error: "not_found", message: "resource not found" }));
+      return;
+    }
+    const scheme =
+      resource.resource_type === "cache"
+        ? "redis"
+        : resource.resource_type === "nosql"
+          ? "mongodb"
+          : resource.resource_type === "queue"
+            ? "nats"
+            : "postgres";
+    sendJSON(res, 200, {
+      ok: true,
+      connection_url: `${scheme}://user:rotated_${randomUUID().slice(0, 8)}@mock-host:5432/db_${token.slice(0, 8)}`,
+    });
+    return;
+  }
+
+  // ── POST /deploy/:id/wake ────────────────────────────────────────────────────
+  // Mirrors DeployHandler.Wake. The mock honours the flag posture: when
+  // scale-to-zero is disabled (the default in this mock) it returns 501
+  // 'scale_to_zero_disabled' BEFORE any auth/lookup — exactly as the real api
+  // does (flag-off is fully inert). A deployment whose name carries the
+  // "wake-ok" marker simulates the flag being ON so the success path is
+  // exercisable too.
+  if (method === "POST" && /^\/deploy\/[^/]+\/wake$/.test(path)) {
+    const id = decodeURIComponent(path.slice("/deploy/".length, path.length - "/wake".length));
+    const deployment = [...state.deployments.values()].find(
+      (d) => d.app_id === id && d.status !== "deleted"
+    );
+    // Flag ON only for deployments explicitly marked wake-enabled. Everything
+    // else (the default) returns the flag-off 501 the real api ships with.
+    const flagOn = deployment?.env["_wake_enabled"] === "1";
+    if (!flagOn) {
+      sendJSON(
+        res,
+        501,
+        errorEnvelope({ error: "scale_to_zero_disabled", message: "Scale-to-zero is not enabled on this platform" })
+      );
+      return;
+    }
+    if (!authed) {
+      sendJSON(res, 401, errorEnvelope({ error: "unauthorized", message: "bearer token required" }));
+      return;
+    }
+    if (!deployment) {
+      sendJSON(res, 404, errorEnvelope({ error: "not_found", message: "deployment not found" }));
+      return;
+    }
+    sendJSON(res, 200, {
+      ok: true,
+      message: "Deployment woken — the app will be reachable once its pod is Ready (cold start).",
+      deployment: { ...deployment, scaled_to_zero: false },
+    });
     return;
   }
 
