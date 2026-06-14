@@ -498,6 +498,33 @@ export interface RotateCredentialsResult {
 }
 
 /**
+ * Response shape from POST /api/v1/leads (LeadsHandler.Create).
+ *
+ * Enterprise interest / contact form. Only `email` is required;
+ * `name`, `company`, and `use_case` are optional enrichment fields.
+ * No authentication required — anonymous callers are accepted. When
+ * called with a valid Bearer token the lead is automatically linked to
+ * the caller's team so sales can see the account.
+ */
+export interface LeadResult {
+  ok: boolean;
+  /** UUID of the newly created enterprise_leads row. */
+  id?: string;
+}
+
+/** Caller-supplied params for create_lead. */
+export interface CreateLeadParams {
+  /** Contact email address. Required. RFC 5322 + 254-char cap. */
+  email: string;
+  /** Contact full name. Optional — max 128 chars. */
+  name?: string;
+  /** Company or organisation name. Optional — max 128 chars. */
+  company?: string;
+  /** Plain-text description of the use case / scale requirements. Optional — max 1024 chars. */
+  use_case?: string;
+}
+
+/**
  * Response shape from POST /deploy/:id/wake (DeployHandler.Wake).
  *
  * Scale-to-zero explicit wake: scales a (possibly scaled-to-zero) deployment
@@ -1700,5 +1727,15 @@ export class InstantClient {
       undefined,
       { requireAuth: true }
     );
+  }
+
+  /**
+   * POST /api/v1/leads — submit an enterprise contact / interest form.
+   *
+   * No authentication required; authenticated callers auto-link the lead
+   * to their team. Returns the UUID of the created record on 201.
+   */
+  async createLead(params: CreateLeadParams): Promise<LeadResult> {
+    return this.request<LeadResult>("POST", "/api/v1/leads", params);
   }
 }
