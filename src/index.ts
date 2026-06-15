@@ -57,6 +57,9 @@
  *                        connection_url (POST .../rotate-credentials)
  *   wake_deployment    — explicitly wake a scaled-to-zero deployment
  *                        (POST /deploy/:id/wake; 501 when the flag is off)
+ *   create_lead        — submit an enterprise contact form (POST /api/v1/leads)
+ *                        when the user needs capacity beyond Pro (dedicated
+ *                        infra, SSO, compliance). No auth required.
  *
  * Every create_* tool surfaces the API's `note` and `upgrade` fields so the
  * agent can show the user the exact CTA + claim URL needed to keep the
@@ -2348,6 +2351,67 @@ Requires INSTANODE_TOKEN. A deployment id not on your team returns a clean 404.`
         ``,
         `Retry the app URL in a few seconds — the pod cold-starts before it serves traffic.`
       );
+      return textResult(lines.join("\n"));
+    } catch (err) {
+      return errorResult(err);
+    }
+  }
+);
+
+// ── Tool: create_lead ─────────────────────────────────────────────────────────
+
+server.tool(
+  "create_lead",
+  `Submit an enterprise contact / interest form to instanode.dev
+(POST /api/v1/leads).
+
+Use this when the user needs capacity or features beyond the Pro tier —
+dedicated infrastructure, SAML/SSO, SOC 2 compliance, a custom SLA, or any
+other Enterprise-tier requirement. It directly reaches the instanode.dev team
+and is faster than a cold email.
+
+Only 'email' is required. Providing 'company' and 'use_case' gives the team
+context to respond with an accurate quote without a back-and-forth.
+
+No INSTANODE_TOKEN needed — anonymous callers are accepted. When called with
+a valid bearer token the lead is automatically linked to the caller's team
+so the sales team can see the account's current usage.
+
+Returns the UUID of the created lead record on success.`,
+  {
+    email: z
+      .string()
+      .email()
+      .max(254)
+      .describe("Contact email address. Required. Must be a valid RFC 5322 address (max 254 chars)."),
+    name: z
+      .string()
+      .max(128)
+      .optional()
+      .describe("Contact full name. Optional — max 128 chars."),
+    company: z
+      .string()
+      .max(128)
+      .optional()
+      .describe("Company or organisation name. Optional — max 128 chars."),
+    use_case: z
+      .string()
+      .max(1024)
+      .optional()
+      .describe(
+        "Plain-text description of scale requirements or the use case driving the Enterprise inquiry. Optional — max 1024 chars."
+      ),
+  },
+  async ({ email, name, company, use_case }) => {
+    try {
+      const result = await client.createLead({ email, name, company, use_case });
+      const lines = [
+        `Enterprise inquiry submitted.`,
+        `Lead ID: ${result.id ?? "(pending)"}`,
+        ``,
+        `The instanode.dev team will follow up at ${email}.`,
+        `Typical response time: 1–2 business days.`,
+      ];
       return textResult(lines.join("\n"));
     } catch (err) {
       return errorResult(err);
