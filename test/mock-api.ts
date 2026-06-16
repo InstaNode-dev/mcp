@@ -157,6 +157,8 @@ export interface MockApiHandle {
   stackEnvFor(slug: string): Record<string, string> | undefined;
   /** Read the current env map a deployment carries (post-PATCH). */
   deployEnvFor(appId: string): Record<string, string> | undefined;
+  /** Total count of POST /api/v1/leads calls received. */
+  leadCount(): number;
   /** Shut the server down. */
   close(): Promise<void>;
 }
@@ -199,6 +201,7 @@ interface State {
   provisionCalls: number;
   deployCalls: number;
   stackCalls: number;
+  leadCalls: number;
 }
 
 function nowIso(): string {
@@ -406,6 +409,7 @@ export function startMockApi(): Promise<MockApiHandle> {
     provisionCalls: 0,
     deployCalls: 0,
     stackCalls: 0,
+    leadCalls: 0,
   };
 
   const server = createServer(async (req, res) => {
@@ -435,6 +439,7 @@ export function startMockApi(): Promise<MockApiHandle> {
         provisionCount: () => state.provisionCalls,
         deployCount: () => state.deployCalls,
         stackCount: () => state.stackCalls,
+        leadCount: () => state.leadCalls,
         seedResource: (opts) => {
           const token = opts?.token ?? randomUUID();
           const resource: MockResource = {
@@ -702,6 +707,25 @@ async function route(req: IncomingMessage, res: ServerResponse, state: State): P
       docs: "https://instanode.dev/llms-full.txt",
       contact: "mailto:enterprise@instanode.dev",
     });
+    return;
+  }
+
+  // ── POST /api/v1/leads ─────────────────────────────────────────────────────
+  if (method === "POST" && path === "/api/v1/leads") {
+    const raw = await readBody(req);
+    let parsed: { email?: unknown; name?: unknown; company?: unknown; use_case?: unknown };
+    try {
+      parsed = raw.length > 0 ? JSON.parse(raw.toString("utf8")) : {};
+    } catch {
+      sendJSON(res, 400, errorEnvelope({ error: "bad_request", message: "malformed JSON body" }));
+      return;
+    }
+    if (!parsed.email || typeof parsed.email !== "string" || parsed.email.trim() === "") {
+      sendJSON(res, 400, errorEnvelope({ error: "missing_email", message: "email is required" }));
+      return;
+    }
+    state.leadCalls += 1;
+    sendJSON(res, 201, { ok: true, id: randomUUID() });
     return;
   }
 
