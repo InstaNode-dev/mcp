@@ -390,4 +390,25 @@ describe("operate-tools endpoint contract (J22-J30)", () => {
     const text = flat(await handlerFor("wake_deployment")({ id: appId }));
     assert.match(text, new RegExp(`Deployment ${appId} woken`));
   });
+
+  it("J31 create_lead → POST /api/v1/leads, returns lead id (anon caller)", async () => {
+    delete process.env["INSTANODE_TOKEN"];
+    const before = mock.leadCount();
+    const text = flat(
+      await handlerFor("create_lead")({
+        email: "cto@enterprise.com",
+        company: "Big Corp",
+        use_case: "Need dedicated Postgres with 1TB storage and SOC 2 compliance.",
+      })
+    );
+    assert.equal(mock.leadCount(), before + 1, "create_lead did not call POST /api/v1/leads");
+    assert.match(text, /Enterprise inquiry submitted/);
+    assert.match(text, /cto@enterprise\.com/);
+  });
+
+  it("J31 create_lead → 400 missing_email when email is absent", async () => {
+    delete process.env["INSTANODE_TOKEN"];
+    const text = flat(await handlerFor("create_lead")({ email: "" }));
+    assert.match(text, /missing_email|invalid/i);
+  });
 });
