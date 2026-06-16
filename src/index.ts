@@ -2384,7 +2384,7 @@ Returns the UUID of the created lead record on success.`,
       .email()
       .max(254)
       .describe("Contact email address. Required. Must be a valid RFC 5322 address (max 254 chars)."),
-    name: z
+    contact_name: z
       .string()
       .max(128)
       .optional()
@@ -2402,9 +2402,9 @@ Returns the UUID of the created lead record on success.`,
         "Plain-text description of scale requirements or the use case driving the Enterprise inquiry. Optional — max 1024 chars."
       ),
   },
-  async ({ email, name, company, use_case }) => {
+  async ({ email, contact_name, company, use_case }) => {
     try {
-      const result = await client.createLead({ email, name, company, use_case });
+      const result = await client.createLead({ email, name: contact_name, company, use_case });
       const lines = [
         `Enterprise inquiry submitted.`,
         `Lead ID: ${result.id ?? "(pending)"}`,

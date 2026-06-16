@@ -397,6 +397,7 @@ describe("operate-tools endpoint contract (J22-J30)", () => {
     const text = flat(
       await handlerFor("create_lead")({
         email: "cto@enterprise.com",
+        contact_name: "Alice Smith",
         company: "Big Corp",
         use_case: "Need dedicated Postgres with 1TB storage and SOC 2 compliance.",
       })

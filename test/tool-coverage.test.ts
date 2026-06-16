@@ -78,6 +78,7 @@ const MAPPED_TOOLS: Record<string, ToolMapping> = {
   resume_resource: { flow: "J28", endpoint: "POST /api/v1/resources/:id/resume" },
   rotate_credentials: { flow: "J29", endpoint: "POST /api/v1/resources/:id/rotate-credentials" },
   wake_deployment: { flow: "J30", endpoint: "POST /deploy/:id/wake" },
+  create_lead: { flow: "J31", endpoint: "POST /api/v1/leads" },
 };
 
 let registry: Record<string, { description?: string; inputSchema?: unknown; handler?: unknown }>;
@@ -115,11 +116,11 @@ before(async () => {
 });
 
 describe("MCP tool-coverage done-bar (drift guard, matrix §4.2)", () => {
-  it("registers exactly 30 tools (sanity vs matrix §1.J)", () => {
+  it("registers exactly 31 tools (sanity vs matrix §1.J)", () => {
     assert.equal(
       registeredNames.length,
-      30,
-      `expected 30 registered tools, got ${registeredNames.length}: ${registeredNames.join(", ")}`
+      31,
+      `expected 31 registered tools, got ${registeredNames.length}: ${registeredNames.join(", ")}`
     );
   });
 
