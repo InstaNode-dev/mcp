@@ -84,6 +84,7 @@ const EXPECTED_TOOLS = [
   "resume_resource",
   "rotate_credentials",
   "wake_deployment",
+  "create_lead",
 ] as const;
 
 /**
@@ -215,7 +216,7 @@ describe("instanode-mcp integration suite", () => {
   // ── Tool registry + schemas ─────────────────────────────────────────────────
 
   describe("tool registry", () => {
-    it("registers exactly the 30 contract tools, no dead ones", async () => {
+    it("registers exactly the 31 contract tools, no dead ones", async () => {
       const { client, close } = await connectClient(mock.url, "none");
       try {
         const { tools } = await client.listTools();
@@ -1058,8 +1059,11 @@ describe("instanode-mcp integration suite", () => {
       const { client, close } = await connectClient(mock.url, "none");
       try {
         const { tools } = await client.listTools();
-        const namedCreates = tools.filter((t) => /^create_/.test(t.name));
-        assert.ok(namedCreates.length >= 7, `expected ≥7 create_* tools, got ${namedCreates.length}`);
+        // create_lead is a contact form (no resource `name` field) — exclude from
+        // the provisioning name-schema check. All other create_* tools provision
+        // named resources and must carry the api name regex.
+        const namedCreates = tools.filter((t) => /^create_/.test(t.name) && t.name !== "create_lead");
+        assert.ok(namedCreates.length >= 7, `expected ≥7 create_* tools (excluding create_lead), got ${namedCreates.length}`);
         for (const tool of namedCreates) {
           const schema = tool.inputSchema as {
             properties?: Record<string, { type?: string; pattern?: string }>;
