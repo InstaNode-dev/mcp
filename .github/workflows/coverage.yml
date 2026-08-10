@@ -14,11 +14,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Full history so diff-cover can resolve origin/<base_ref>.
           fetch-depth: 0
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           # >=22 for --test-coverage-exclude support (added 22.5.0).
           node-version: 22
@@ -65,7 +65,7 @@ jobs:
             dist-test/test/input-hardening-unit.test.js \
             dist-test/test/deploy-id-schema-unit.test.js \
             dist-test/test/error-contract-unit.test.js
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         if: github.event_name == 'pull_request'
         with:
           python-version: '3.12'
